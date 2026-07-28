@@ -1,0 +1,72 @@
+name: Send iOS Apps Gone Free Email
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # once a day at 1am UTC = 8am Vietnam (UTC+7) - see README to change
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to push the dedup-state branch (see "Persist" step below)
+
+jobs:
+  send-email:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # Same "dedup-via-state-branch" trick as tech-price-mailer / gold-price-emailer:
+      # the "already notified about this app" file lives on its own branch (apps-state),
+      # checked out into a worktree alongside main so main's own files are never touched.
+      # First-ever run: the branch doesn't exist yet, so an empty orphan one is created locally.
+      - name: Restore dedup state from state branch
+        run: |
+          if git ls-remote --exit-code --heads origin apps-state >/dev/null 2>&1; then
+            git fetch origin apps-state:apps-state
+            git worktree add state-wt apps-state
+          else
+            echo "No apps-state branch yet - starting fresh."
+            git worktree add --orphan -B apps-state state-wt
+            find state-wt -mindepth 1 -not -path 'state-wt/.git*' -delete
+          fi
+          mkdir -p state-wt/state
+
+      - name: Generate email
+        env:
+          STATE_FILE: state-wt/state/notified.json
+          COUNTRY: "us"
+          COOLDOWN_DAYS: "21"
+        run: python apps_gone_free_emailer.py generate
+
+      - name: Send email
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          APPS_RECIPIENT: ${{ secrets.APPS_RECIPIENT }}
+        run: python apps_gone_free_emailer.py send
+
+      - name: Persist dedup state to state branch
+        run: |
+          cd state-wt
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No state changes to persist this run."
+          else
+            git commit -q -m "Update notified-apps state [skip ci]"
+            git push -q origin apps-state
+          fi
+          cd ..
+          git worktree remove state-wt --force
