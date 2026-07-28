@@ -2,7 +2,7 @@ name: Send iOS Apps Gone Free Email
 
 on:
   schedule:
-    - cron: "0 1 * * *"   # once a day at 1am UTC = 8am Vietnam (UTC+7) - see README to change
+    - cron: "*/30 * * * *" 
   workflow_dispatch: {}
 
 permissions:
