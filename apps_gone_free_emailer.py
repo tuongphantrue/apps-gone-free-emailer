@@ -82,23 +82,25 @@ NOTE ON SCRAPING
 Always worth checking the current robots.txt / terms before running this
 unattended long-term: https://www.igeeksblog.com/robots.txt
 
-iGeeksBlog's page markup can change at any time, and separately, a
-request from this script might just get treated differently than a
-browser's (bot/anti-scraping filtering, or GitHub Actions' well-known
-datacenter IP ranges getting flagged) - HEADERS below is set to look
-like an ordinary current browser request for that reason, but there's
-no guarantee it always gets past whatever a given site runs. Either way,
-whenever a source parses to 0 apps, fetch_all_sources() saves the raw
-response it actually received to DEBUG_DIR (uploaded as a workflow
-artifact - see README's "Troubleshooting" section) and logs whether
-"gone free" text shows up anywhere in it at all, which is the fast way
-to tell "the real page came through, parse_igeeksblog() just needs
-adjusting to match a markup change" apart from "this wasn't the real
-page at all." parse_igeeksblog() itself matches by walking link/text
-structure (which "Gone Free" section heading an app store link falls
-after, then the next tag whose text matches "Price: ...") rather than
-depending on exact CSS classes or tag nesting, which should make it
-reasonably resilient to small markup tweaks - but no guarantees. Open the
+iGeeksBlog's page markup can change at any time. (An earlier version of
+this note theorized that a 0-apps run might be bot/anti-scraping
+filtering treating this script's request differently than a browser's -
+that turned out not to be it: a real 0-apps run's raw HTML showed the
+actual page came through fine, just structured differently than
+parse_igeeksblog() assumed at the time. HEADERS below still looks like
+an ordinary current browser request, which can't hurt, but isn't the
+main defense here.) Whenever a source parses to 0 apps,
+fetch_all_sources() saves the raw response it actually received to
+DEBUG_DIR (uploaded as a workflow artifact - see README's
+"Troubleshooting" section) and logs whether "gone free" text shows up
+anywhere in it at all - that's the fast way to tell "the real page came
+through, parse_igeeksblog() needs adjusting to match a markup change"
+apart from "this wasn't the real page at all," but either way, the
+actual saved HTML is what settles it, not a guess. parse_igeeksblog()
+itself targets iGeeksBlog's app-listing plugin ("WP-Appbox," visible in
+an HTML comment around each entry) directly via its div.wpappbox /
+.apptitle / .appicon / .price .value structure, confirmed against real
+page source rather than inferred from a text-only rendering. Open the
 page, view source, and adjust parse_igeeksblog() if it starts returning 0.
 """
 
@@ -180,13 +182,13 @@ def http_get(url, params=None, timeout=20):
 
 IGEEKSBLOG_URL = os.environ.get("IGEEKSBLOG_URL", "https://www.igeeksblog.com/paid-iphone-apps-gone-free/")
 APP_STORE_LINK_RE = re.compile(r"apps\.apple\.com/[a-z]{2}/app/[^/\s]+/id(\d+)", re.IGNORECASE)
-# Deliberately strict (exactly "Free" or "Free+", nothing else) rather than `.+` - needed because
-# parse_igeeksblog() below reads *any* tag's full text now, not just leaf tags, so this is what
-# keeps a wrapping element with extra unrelated text from false-matching. Also deliberately does
-# NOT match dollar amounts: if the "on sale" end-boundary heading is ever missed (markup change)
-# and the walk spills into the SALE section, a paid app's "Price: $X.XX" simply won't match
-# anything here - silently skipped, rather than risking a paid app being mislabeled as free.
-PRICE_LABEL_RE = re.compile(r"^price:\s*(free\+?)\s*$", re.IGNORECASE)
+# Matches the .price .value span's own text directly (get_text() on that span already
+# concatenates the nested <sup>+</sup> in, so "Free+" arrives as one string - see
+# parse_igeeksblog()). Deliberately excludes dollar amounts: if the "on sale" end-boundary
+# heading is ever missed (markup change) and the walk spills into the SALE section, a paid
+# app's "$X.XX" value simply won't match - silently skipped rather than risking a paid app
+# being mislabeled as free.
+GONE_FREE_VALUE_RE = re.compile(r"^free\+?$", re.IGNORECASE)
 
 
 def _find_heading(soup, contains_text):
@@ -213,23 +215,33 @@ def parse_igeeksblog(html):
     """iGeeksBlog's page has a "Today's Apps Gone Free" section followed by
     a "Today's Apps on SALE" section (discounted, NOT free - deliberately
     excluded here, that's a different thing than what was asked for).
-    Each app in the gone-free section renders as 2-3 links to the same
-    apps.apple.com/.../id###### URL (an image link, sometimes an empty
-    decorative link, and a text link carrying the app's name), followed by
-    a short "Price: Free" / "Price: Free+" line.
 
-    This walks the parsed tree in document order (find_all_next, which is
-    agnostic to exact nesting/class names - more resilient to markup
-    tweaks than a strict CSS-selector approach) rather than depending on
-    specific div/class structure: group consecutive links that point at
-    the same app id, then pair that group with the next tag whose full
-    text matches "Price: Free" / "Price: Free+" exactly (this matches on
-    any tag, not just ones with no nested children, so a price wrapped
-    like <p><strong>Price:</strong> Free</p> still gets picked up from the
-    <p>'s combined text - current_id gets cleared the moment a match
-    fires, so an outer wrapper and its inner tag matching the identical
-    text don't get double-counted). Hitting another heading first stops
-    the walk rather than reading into a later section.
+    Each app renders via a WordPress plugin ("WP-Appbox", visible in an
+    HTML comment around each block) as a `div.wpappbox` with a
+    consistent internal structure:
+        <div class="wpappbox ...">
+          <div class="appicon"><a href="APP_STORE_URL"><img src="ICON"></a></div>
+          <a class="applinks" href="APP_STORE_URL"></a>
+          <div class="appdetails">
+            <div class="apptitle"><a href="APP_STORE_URL">NAME</a></div>
+            <div class="price">
+              <span class="label">Price: </span>
+              <span class="value">Free<sup>+</sup></span>
+            </div>
+          </div>
+        </div>
+    Confirmed directly from the page's real HTML (not guessed from a
+    text/markdown rendering, which strips exactly this kind of detail) -
+    notably, "Price:" and the value are two SEPARATE spans, and "+" is
+    its own nested <sup> - there's never one tag whose own text reads
+    "Price: Free", which is why an earlier version of this parser (built
+    by inference rather than against the real markup) found nothing.
+
+    This still uses heading text to find the section boundaries (find_all_next,
+    agnostic to exact class names, in case that part of the layout shifts),
+    but within those boundaries now targets div.wpappbox specifically rather
+    than a generic link-clustering heuristic - much less ambiguous given
+    a real, named, consistently-structured component to anchor on.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -240,41 +252,43 @@ def parse_igeeksblog(html):
 
     apps = []
     seen_ids = set()
-    current_id, current_name, current_icon = None, None, None
-
     for tag in start.find_all_next(True):  # True = any tag, in document order
         if end is not None and tag is end:
             break
         if tag.name in ("h2", "h3"):
             break  # some other section boundary we didn't expect - stop rather than over-read
-        if tag.name == "a":
-            href = tag.get("href", "")
-            m = APP_STORE_LINK_RE.search(href)
-            if not m:
-                continue
-            app_id = m.group(1)
-            if app_id != current_id:
-                current_id, current_name, current_icon = app_id, None, None
-            text = tag.get_text(strip=True)
-            if text and not current_name:
-                current_name = text
-            img = tag.find("img")
-            if img and img.get("src") and not current_icon:
-                current_icon = img["src"]
-        elif tag.name not in ("a",):
-            text = tag.get_text(" ", strip=True)
-            m2 = PRICE_LABEL_RE.match(text)
-            if m2 and current_id and current_id not in seen_ids:
-                seen_ids.add(current_id)
-                apps.append({
-                    "id": current_id,
-                    "name": current_name or "Unknown app",
-                    "icon": current_icon or "",
-                    "url": f"https://apps.apple.com/app/id{current_id}",
-                    "price_label": m2.group(1).strip(),
-                    "source": "iGeeksBlog",
-                })
-                current_id = None
+        if tag.name != "div" or "wpappbox" not in (tag.get("class") or []):
+            continue
+
+        link = tag.select_one(".apptitle a") or tag.select_one(".appicon a")
+        if not link:
+            continue
+        m = APP_STORE_LINK_RE.search(link.get("href", ""))
+        if not m:
+            continue
+        app_id = m.group(1)
+        if app_id in seen_ids:
+            continue
+
+        value_el = tag.select_one(".price .value")
+        price_text = value_el.get_text(strip=True) if value_el else ""
+        if not GONE_FREE_VALUE_RE.match(price_text):
+            continue  # e.g. a dollar amount - not actually free, don't include it
+
+        icon_el = tag.select_one(".appicon img")
+        icon = icon_el.get("src", "").strip() if icon_el else ""
+        if icon.startswith("//"):
+            icon = "https:" + icon  # protocol-relative URLs don't render reliably in email
+
+        seen_ids.add(app_id)
+        apps.append({
+            "id": app_id,
+            "name": link.get_text(strip=True) or link.get("aria-label", "").strip() or "Unknown app",
+            "icon": icon,
+            "url": f"https://apps.apple.com/app/id{app_id}",
+            "price_label": price_text,
+            "source": "iGeeksBlog",
+        })
     return apps
 
 
