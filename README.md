@@ -186,12 +186,6 @@ case that's a useful pattern to copy) and append it to `SOURCES`.
   workflow.
 - GitHub Actions free tier includes 2,000 minutes/month for private repos.
 - You can also trigger it manually anytime via the "Run workflow" button.
-- If a run logs "0 apps scraped from every source" (check the Actions
-  log), iGeeksBlog's page structure has probably changed - open the page,
-  view source, and adjust `parse_igeeksblog()` in
-  `apps_gone_free_emailer.py` to match. This is exactly the same kind of
-  "site changed its markup" caveat tech-price-mailer has for
-  MemoryZone.vn - unofficial scrapers can break without notice.
 - Worth checking iGeeksBlog's current `robots.txt` / terms before
   running this unattended long-term: <https://www.igeeksblog.com/robots.txt>
 - This tool isn't affiliated with iGeeksBlog or Apple; it just reads a
@@ -199,6 +193,48 @@ case that's a useful pattern to copy) and append it to `SOURCES`.
   to something aggressive (e.g. every few minutes) against a small site's
   server for a page that only changes about once a day.
 - This is a personal notification tool, not investment or purchase advice.
+
+### Troubleshooting: a run logs "0 apps scraped from every source"
+
+[#troubleshooting-a-run-logs-0-apps-scraped-from-every-source](#troubleshooting-a-run-logs-0-apps-scraped-from-every-source)
+
+This happened during testing, so it's worth explaining exactly what was
+going on rather than just saying "it's fixed now." Fetching
+`igeeksblog.com` directly (outside the workflow) showed the page's
+content and structure completely intact - same "Today's Apps Gone Free"
+heading, same markup pattern the parser expects - so the page itself
+wasn't the problem. The best explanation is that the request the GitHub
+Actions runner made didn't get the same response: the script's request
+headers were pretty minimal (a two-year-stale Chrome version string and
+almost nothing else), which is exactly the kind of fingerprint that
+basic bot/anti-scraping filtering can treat differently from an ordinary
+browser visit - independent of that, GitHub Actions runner IPs are
+well-known datacenter ranges that some sites' protection treats more
+suspiciously than residential/consumer traffic to begin with. It's hard
+to be fully certain of the exact mechanism from outside the runner
+itself, so rather than just guess further, three changes went in together:
+
+1. **More realistic request headers** (current Chrome version,
+   `Accept-Language`, `Accept-Encoding`, `Referer`, etc.) - a legitimate
+   hardening step, not impersonating any specific named crawler.
+2. **A more resilient parser** - `_find_heading()` now also checks
+   non-semantic "heading-styled" tags (page builders sometimes skip real
+   `<h2>`/`<h3>` tags), and the price-line match no longer requires a
+   "leaf" tag with no nested children, so a price wrapped like
+   `<p><strong>Price:</strong> Free</p>` is no longer missed.
+3. **A debug artifact for next time.** Whenever a source parses to 0
+   apps now, the exact raw HTML that request received gets saved and
+   uploaded as a workflow artifact named **debug-html** (visible at the
+   bottom of that run's summary page, kept 14 days) - plus the log
+   itself says whether "gone free" text or an App Store link shows up
+   *anywhere* in that raw response, which is the quickest way to tell
+   "the real page came through, the parser just needs adjusting" apart
+   from "this wasn't the real page at all" (bot/consent check, or an
+   unrendered JS shell) without downloading anything.
+
+If it happens again: download that artifact from the failed run's page,
+open the HTML file, and it'll be immediately obvious which situation
+you're in and what (if anything) `parse_igeeksblog()` needs to match.
 
 ## Running locally instead
 
