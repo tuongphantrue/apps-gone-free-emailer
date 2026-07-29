@@ -168,9 +168,10 @@ iGeeksBlog. `fetch_all_sources()` already fetches every entry in that
 list, tolerates any one of them failing, and dedupes apps by App Store
 id across sources. To add a second site, write a
 `parse_<site>(html) -> [{"id", "name", "icon", "url", "price_label"}, ...]`
-function (see `parse_igeeksblog()` for the shape - it deliberately
-doesn't depend on exact CSS class names, just link/heading structure, in
-case that's a useful pattern to copy) and append it to `SOURCES`.
+function (see `parse_igeeksblog()` for the shape) and append it to
+`SOURCES`. Worth grabbing real page source (view-source, not a
+text/markdown rendering of it) before writing the parser - see
+"Troubleshooting" below for exactly why that distinction mattered here.
 
 ## Notes
 
@@ -198,43 +199,46 @@ case that's a useful pattern to copy) and append it to `SOURCES`.
 
 [#troubleshooting-a-run-logs-0-apps-scraped-from-every-source](#troubleshooting-a-run-logs-0-apps-scraped-from-every-source)
 
-This happened during testing, so it's worth explaining exactly what was
-going on rather than just saying "it's fixed now." Fetching
-`igeeksblog.com` directly (outside the workflow) showed the page's
-content and structure completely intact - same "Today's Apps Gone Free"
-heading, same markup pattern the parser expects - so the page itself
-wasn't the problem. The best explanation is that the request the GitHub
-Actions runner made didn't get the same response: the script's request
-headers were pretty minimal (a two-year-stale Chrome version string and
-almost nothing else), which is exactly the kind of fingerprint that
-basic bot/anti-scraping filtering can treat differently from an ordinary
-browser visit - independent of that, GitHub Actions runner IPs are
-well-known datacenter ranges that some sites' protection treats more
-suspiciously than residential/consumer traffic to begin with. It's hard
-to be fully certain of the exact mechanism from outside the runner
-itself, so rather than just guess further, three changes went in together:
+This happened twice during testing, and the two incidents pointed at
+different things - worth the full history rather than just "it's fixed
+now," since the second one is exactly why the debug-artifact step below
+exists.
 
-1. **More realistic request headers** (current Chrome version,
-   `Accept-Language`, `Accept-Encoding`, `Referer`, etc.) - a legitimate
-   hardening step, not impersonating any specific named crawler.
-2. **A more resilient parser** - `_find_heading()` now also checks
-   non-semantic "heading-styled" tags (page builders sometimes skip real
-   `<h2>`/`<h3>` tags), and the price-line match no longer requires a
-   "leaf" tag with no nested children, so a price wrapped like
-   `<p><strong>Price:</strong> Free</p>` is no longer missed.
-3. **A debug artifact for next time.** Whenever a source parses to 0
-   apps now, the exact raw HTML that request received gets saved and
-   uploaded as a workflow artifact named **debug-html** (visible at the
-   bottom of that run's summary page, kept 14 days) - plus the log
-   itself says whether "gone free" text or an App Store link shows up
-   *anywhere* in that raw response, which is the quickest way to tell
-   "the real page came through, the parser just needs adjusting" apart
-   from "this wasn't the real page at all" (bot/consent check, or an
-   unrendered JS shell) without downloading anything.
+**First incident:** fetching `igeeksblog.com` directly (outside the
+workflow) showed what looked like the page's content and structure
+completely intact, so the leading theory was that the *request* wasn't
+getting the same response the workflow needed - stale/minimal headers
+reading as a bot, or GitHub Actions' well-known datacenter IPs getting
+filtered. Headers got hardened (current Chrome version, `Accept-Language`,
+`Accept-Encoding`, `Referer`) and the parser got more defensive
+(`_find_heading()` checking non-semantic tags too, price matching no
+longer requiring a childless tag) - reasonable fixes, but this theory
+was never actually confirmed against the raw bytes the runner received,
+just inferred from a separate fetch that turned out not to be equivalent.
 
-If it happens again: download that artifact from the failed run's page,
-open the HTML file, and it'll be immediately obvious which situation
-you're in and what (if anything) `parse_igeeksblog()` needs to match.
+**Second incident, with the actual raw HTML in hand:** the real page
+came through completely fine (HTTP 200, ~108KB, "Today's Apps Gone
+Free" heading present and intact) - so the first incident's bot-blocking
+theory was likely wrong from the start. The actual bug: iGeeksBlog
+renders each app's price as **two separate `<span>` elements** -
+`<span class="label">Price: </span>` and `<span class="value">Free<sup>+</sup></span>`
+with the "+" in a nested `<sup>` - so no single tag's text ever reads
+"Price: Free". The original parser was built by inference from a
+text/markdown rendering of the page (which flattens exactly this kind
+of structural detail away), not from the real HTML, and simply never
+had a chance of matching. `parse_igeeksblog()` now targets iGeeksBlog's
+underlying listing plugin directly (`div.wpappbox`, with `.apptitle`,
+`.appicon`, and `.price .value` inside it - visible as "WP-Appbox" in
+an HTML comment around each entry) instead of inferring structure,
+verified directly against a real saved copy of the page.
+
+**The debug artifact exists precisely because of this gap.** Whenever a
+source parses to 0 apps, the exact raw HTML that request received gets
+saved and uploaded as a workflow artifact named **debug-html** (bottom
+of that run's summary page, kept 14 days) - if it happens again,
+download that file (or view-source the live page directly and copy the
+relevant section) rather than reasoning from how the page reads when
+converted to text, which is what went wrong the first time.
 
 ## Running locally instead
 
