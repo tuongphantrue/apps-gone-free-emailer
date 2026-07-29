@@ -97,17 +97,26 @@ That's it - from now on it runs automatically on the schedule below.
 Open `.github/workflows/send-apps-gone-free.yml` and edit this line:
 
 ```
-- cron: "0 1 * * *"
+- cron: "*/30 * * * *"
 ```
 
 Cron format is `minute hour day month weekday`, always in **UTC**.
 
-- `0 1 * * *` -> once a day at 1am UTC (8am Vietnam, UTC+7) - current setting
+- `*/30 * * * *` -> every 30 minutes - current setting
+- `0 1 * * *` -> once a day at 1am UTC (8am Vietnam, UTC+7)
 - `0 1,13 * * *` -> twice a day, 1am and 1pm UTC
 - `0 */6 * * *` -> every 6 hours
 
-iGeeksBlog updates that page roughly daily, so running more than a couple
-times a day mostly just means more "nothing new" runs, not more emails.
+iGeeksBlog updates that page roughly daily, so at `*/30 * * * *` most of
+the ~48 runs/day will find nothing new and send no email - the dedup
+state means you won't get repeat emails about the same app. Two things
+worth knowing about running it this often, purely as information, not a
+suggestion to change it: it's about 48x more requests against a small
+site's server than the content needs, and it uses noticeably more of
+your Actions minutes (private repos get 2,000 free/month; 48 runs/day is
+roughly 1,000-1,500+ minutes/month depending on how long each run takes,
+versus well under 100/month at once a day). Mentioning it once here in
+case it's useful later - the schedule line itself is yours to keep.
 
 ## Avoiding duplicate emails (cooldown)
 
