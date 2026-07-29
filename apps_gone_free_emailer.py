@@ -82,12 +82,23 @@ NOTE ON SCRAPING
 Always worth checking the current robots.txt / terms before running this
 unattended long-term: https://www.igeeksblog.com/robots.txt
 
-iGeeksBlog's page markup can change at any time - if `generate` reports
-0 apps parsed, the page structure has probably changed. parse_igeeksblog()
-below matches by walking link/text structure (which "Gone Free" section
-heading an app store link falls after, then the next short leaf-text
-node matching "Price: ...") rather than depending on exact CSS classes,
-which should make it reasonably resilient - but no guarantees. Open the
+iGeeksBlog's page markup can change at any time, and separately, a
+request from this script might just get treated differently than a
+browser's (bot/anti-scraping filtering, or GitHub Actions' well-known
+datacenter IP ranges getting flagged) - HEADERS below is set to look
+like an ordinary current browser request for that reason, but there's
+no guarantee it always gets past whatever a given site runs. Either way,
+whenever a source parses to 0 apps, fetch_all_sources() saves the raw
+response it actually received to DEBUG_DIR (uploaded as a workflow
+artifact - see README's "Troubleshooting" section) and logs whether
+"gone free" text shows up anywhere in it at all, which is the fast way
+to tell "the real page came through, parse_igeeksblog() just needs
+adjusting to match a markup change" apart from "this wasn't the real
+page at all." parse_igeeksblog() itself matches by walking link/text
+structure (which "Gone Free" section heading an app store link falls
+after, then the next tag whose text matches "Price: ...") rather than
+depending on exact CSS classes or tag nesting, which should make it
+reasonably resilient to small markup tweaks - but no guarantees. Open the
 page, view source, and adjust parse_igeeksblog() if it starts returning 0.
 """
 
@@ -129,9 +140,14 @@ ALLOW_INSECURE_SSL_FALLBACK = os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "fal
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/json",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.google.com/",
 }
 
 GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS")
@@ -164,17 +180,31 @@ def http_get(url, params=None, timeout=20):
 
 IGEEKSBLOG_URL = os.environ.get("IGEEKSBLOG_URL", "https://www.igeeksblog.com/paid-iphone-apps-gone-free/")
 APP_STORE_LINK_RE = re.compile(r"apps\.apple\.com/[a-z]{2}/app/[^/\s]+/id(\d+)", re.IGNORECASE)
-PRICE_LABEL_RE = re.compile(r"^price:\s*(.+)$", re.IGNORECASE)
+# Deliberately strict (exactly "Free" or "Free+", nothing else) rather than `.+` - needed because
+# parse_igeeksblog() below reads *any* tag's full text now, not just leaf tags, so this is what
+# keeps a wrapping element with extra unrelated text from false-matching. Also deliberately does
+# NOT match dollar amounts: if the "on sale" end-boundary heading is ever missed (markup change)
+# and the walk spills into the SALE section, a paid app's "Price: $X.XX" simply won't match
+# anything here - silently skipped, rather than risking a paid app being mislabeled as free.
+PRICE_LABEL_RE = re.compile(r"^price:\s*(free\+?)\s*$", re.IGNORECASE)
 
 
 def _find_heading(soup, contains_text):
-    """First h2/h3 whose text contains `contains_text` (case-insensitive).
-    Curly vs straight apostrophes ("Today's" vs "Today’s") are normalized
-    away first so this doesn't depend on which one the page happens to use."""
+    """First heading-ish tag whose text contains `contains_text`
+    (case-insensitive). Curly vs straight apostrophes ("Today's" vs
+    "Today’s") are normalized away first so this doesn't depend on which
+    one the page happens to use. Tries real h1-h6 tags first (the common
+    case); if none match, falls back to any short tag (<=80 chars) with
+    that text, in case the site's using a page-builder block styled as a
+    heading rather than a semantic one."""
     needle = contains_text.lower()
-    for tag in soup.find_all(["h2", "h3"]):
+    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
         t = tag.get_text(" ", strip=True).lower().replace("\u2019", "'")
         if needle in t:
+            return tag
+    for tag in soup.find_all(["div", "p", "span", "strong", "b", "a"]):
+        t = tag.get_text(" ", strip=True).lower().replace("\u2019", "'")
+        if needle in t and len(t) <= 80:
             return tag
     return None
 
@@ -192,9 +222,14 @@ def parse_igeeksblog(html):
     agnostic to exact nesting/class names - more resilient to markup
     tweaks than a strict CSS-selector approach) rather than depending on
     specific div/class structure: group consecutive links that point at
-    the same app id, then pair that group with the next short leaf-text
-    node that matches "Price: ...". Hitting another heading first (h2/h3)
-    stops the walk rather than reading into a later section.
+    the same app id, then pair that group with the next tag whose full
+    text matches "Price: Free" / "Price: Free+" exactly (this matches on
+    any tag, not just ones with no nested children, so a price wrapped
+    like <p><strong>Price:</strong> Free</p> still gets picked up from the
+    <p>'s combined text - current_id gets cleared the moment a match
+    fires, so an outer wrapper and its inner tag matching the identical
+    text don't get double-counted). Hitting another heading first stops
+    the walk rather than reading into a later section.
     """
     soup = BeautifulSoup(html, "html.parser")
 
@@ -226,8 +261,8 @@ def parse_igeeksblog(html):
             img = tag.find("img")
             if img and img.get("src") and not current_icon:
                 current_icon = img["src"]
-        elif not tag.find(True):  # "leaf" tag (no nested tags) - safe to read its text exactly once
-            text = tag.get_text(strip=True)
+        elif tag.name not in ("a",):
+            text = tag.get_text(" ", strip=True)
             m2 = PRICE_LABEL_RE.match(text)
             if m2 and current_id and current_id not in seen_ids:
                 seen_ids.add(current_id)
@@ -250,11 +285,24 @@ SOURCES = [
 ]
 
 
+DEBUG_DIR = "debug"
+
+
 def fetch_all_sources():
     """Fetches + parses every entry in SOURCES, tolerating any one of them
     failing (same graceful-degradation spirit as currency-rate-emailer's
     per-source try/except). Dedupes by app id across sources, first
-    source in the list wins on a duplicate."""
+    source in the list wins on a duplicate.
+
+    Whenever a source parses to 0 apps, the raw response is saved under
+    DEBUG_DIR and a same-page substring check is logged - this is meant
+    to distinguish two very different failure modes without needing to
+    guess: "the real page came through but doesn't match the parser's
+    assumptions anymore" (fixable by adjusting the parser) vs "this
+    response isn't the real page at all" (e.g. a bot-check/consent page,
+    or a JS-shell HTML if the site's prerendering treats this script's
+    request differently than a browser's - the raw file lands in the
+    'debug-html' workflow artifact either way, see README)."""
     seen_ids = set()
     all_apps = []
     for source in SOURCES:
@@ -263,8 +311,20 @@ def fetch_all_sources():
             apps = source["parser"](resp.text)
             print(f"  {source['name']}: parsed {len(apps)} app(s) from {source['url']}")
             if not apps:
-                print(f"  {source['name']} returned 0 apps - the page structure may have changed; "
-                      f"open {source['url']} and check its parser.", file=sys.stderr)
+                looks_relevant = "gone free" in resp.text.lower() or "apps.apple.com" in resp.text.lower()
+                print(f"  {source['name']} returned 0 apps (HTTP {resp.status_code}, "
+                      f"{len(resp.text)} chars). 'gone free' or an App Store link "
+                      f"{'DOES' if looks_relevant else 'does NOT'} appear anywhere in the raw "
+                      f"response - {'the content looks like the real page, so the parser most likely '
+                      'needs adjusting to match a markup change' if looks_relevant else 'this response '
+                      'may not be the real page at all (bot/consent check, or an unrendered JS shell)'}.",
+                      file=sys.stderr)
+                os.makedirs(DEBUG_DIR, exist_ok=True)
+                debug_path = os.path.join(DEBUG_DIR, f"{source['name'].lower().replace(' ', '_')}_raw.html")
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                print(f"  saved raw response to {debug_path} for inspection "
+                      f"(uploaded as a workflow artifact - see README).", file=sys.stderr)
             for app in apps:
                 if app["id"] not in seen_ids:
                     seen_ids.add(app["id"])
