@@ -51,6 +51,18 @@ jobs:
           COOLDOWN_DAYS: "21"
         run: python apps_gone_free_emailer.py generate
 
+      # Only exists if a source parsed to 0 apps this run (see fetch_all_sources()
+      # in apps_gone_free_emailer.py) - upload-artifact no-ops via if-no-files-found
+      # when debug/ wasn't created, so this is a no-op on a normal successful run.
+      - name: Upload debug HTML (only if a source returned 0 apps)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Send email
         env:
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
