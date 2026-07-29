@@ -312,12 +312,16 @@ def fetch_all_sources():
             print(f"  {source['name']}: parsed {len(apps)} app(s) from {source['url']}")
             if not apps:
                 looks_relevant = "gone free" in resp.text.lower() or "apps.apple.com" in resp.text.lower()
+                if looks_relevant:
+                    explanation = ("the content looks like the real page, so the parser most "
+                                    "likely needs adjusting to match a markup change")
+                else:
+                    explanation = ("this response may not be the real page at all "
+                                    "(bot/consent check, or an unrendered JS shell)")
                 print(f"  {source['name']} returned 0 apps (HTTP {resp.status_code}, "
                       f"{len(resp.text)} chars). 'gone free' or an App Store link "
                       f"{'DOES' if looks_relevant else 'does NOT'} appear anywhere in the raw "
-                      f"response - {'the content looks like the real page, so the parser most likely '
-                      'needs adjusting to match a markup change' if looks_relevant else 'this response '
-                      'may not be the real page at all (bot/consent check, or an unrendered JS shell)'}.",
+                      f"response - {explanation}.",
                       file=sys.stderr)
                 os.makedirs(DEBUG_DIR, exist_ok=True)
                 debug_path = os.path.join(DEBUG_DIR, f"{source['name'].lower().replace(' ', '_')}_raw.html")
