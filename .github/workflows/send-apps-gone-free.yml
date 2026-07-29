@@ -2,7 +2,7 @@ name: Send iOS Apps Gone Free Email
 
 on:
   schedule:
-    - cron: "*/30 * * * *" 
+    - cron: "*/30 * * * *"   # every 30 minutes - set intentionally, leave as-is
   workflow_dispatch: {}
 
 permissions:
