@@ -195,18 +195,35 @@ def _find_heading(soup, contains_text):
     """First heading-ish tag whose text contains `contains_text`
     (case-insensitive). Curly vs straight apostrophes ("Today's" vs
     "Today’s") are normalized away first so this doesn't depend on which
-    one the page happens to use. Tries real h1-h6 tags first (the common
-    case); if none match, falls back to any short tag (<=80 chars) with
-    that text, in case the site's using a page-builder block styled as a
-    heading rather than a semantic one."""
+    one the page happens to use.
+
+    Deliberately tries h2-h6 first and h1 dead last, not all six
+    together: find_all() with a list of tag names returns matches in
+    DOCUMENT ORDER, not grouped by level, and a page's own <h1> title
+    will often itself contain whatever the body sections are about -
+    here, literally "Today's Apps Gone Free on The App Store" - and
+    that h1 sits near the top of the page, well before the real section
+    heading. Searching all six together let that h1 win by document
+    position every time, which produced a real 0-apps-parsed bug (the
+    walk then started from the h1, hit the Table of Contents' own
+    unrelated <h2> almost immediately, and stopped there). h2-h6 are
+    reliably body section headings on essentially every blog/CMS, so
+    they're tried first; the short-tag fallback after that covers
+    page-builder blocks that skip semantic headings entirely; h1 is
+    only consulted if genuinely nothing else matches anywhere.
+    """
     needle = contains_text.lower()
-    for tag in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+    for tag in soup.find_all(["h2", "h3", "h4", "h5", "h6"]):
         t = tag.get_text(" ", strip=True).lower().replace("\u2019", "'")
         if needle in t:
             return tag
     for tag in soup.find_all(["div", "p", "span", "strong", "b", "a"]):
         t = tag.get_text(" ", strip=True).lower().replace("\u2019", "'")
         if needle in t and len(t) <= 80:
+            return tag
+    for tag in soup.find_all(["h1"]):
+        t = tag.get_text(" ", strip=True).lower().replace("\u2019", "'")
+        if needle in t:
             return tag
     return None
 
