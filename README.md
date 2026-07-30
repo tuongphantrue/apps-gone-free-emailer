@@ -240,6 +240,25 @@ download that file (or view-source the live page directly and copy the
 relevant section) rather than reasoning from how the page reads when
 converted to text, which is what went wrong the first time.
 
+**Third incident, same symptom, one more layer down.** The `div.wpappbox`
+rewrite above was itself tested against a real saved copy of the page -
+and still shipped with a bug, because that saved copy had been trimmed
+down to "the relevant part" (the app listings) and happened to leave out
+the page's own `<h1>` title and its Table of Contents block. The page's
+`<h1>` reads "Today's Apps Gone Free **on The App Store**" - which,
+being a page about apps gone free, itself contains "gone free." Heading
+search was checking h1 together with h2-h6, and since matches come back
+in document order rather than grouped by level, that h1 - sitting near
+the very top of the page - won over the real `<h2>` section heading
+every time. The search then started walking from the wrong point,
+immediately hit the Table of Contents' own unrelated `<h2>Table of
+Contents</h2>`, and stopped right there. Fix: h2-h6 are checked first
+(reliably body section headings on essentially any blog), h1 only as an
+absolute last resort. The trimmed fixture is retired; the current test
+suite runs against the complete page structure specifically so a
+same-shaped bug can't hide in whatever got left out of an "obviously
+irrelevant" trim next time either.
+
 ## Running locally instead
 
 [#running-locally-instead](#running-locally-instead)
