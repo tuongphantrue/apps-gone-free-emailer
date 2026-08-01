@@ -55,6 +55,10 @@ USAGE
            and updates the "already notified about this app" state file
     python apps_gone_free_emailer.py send
         -> reads ./email/* and sends it via Gmail SMTP
+    python apps_gone_free_emailer.py preview
+        -> writes preview.html / preview.txt from sample data through the
+           real template functions - no network, no state touched, nothing
+           sent. Use this to check the design after editing build_html().
 
 SETUP
 -----
@@ -125,6 +129,12 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Config ------------------------------------------------------------
+
+# Bumped whenever parse_igeeksblog() or _find_heading() changes meaningfully.
+# Printed at the start of every `generate` run specifically so a log is
+# self-describing about which fix actually ran, rather than needing to
+# diff file contents by hand to answer "is this the latest version?"
+SCRIPT_VERSION = "2026-07-31.7 (corrected light theme + blue accent from real screenshot)"
 
 COUNTRY = os.environ.get("COUNTRY", "us").strip().lower()
 STATE_FILE = os.environ.get("STATE_FILE", "state/notified.json")
@@ -395,6 +405,7 @@ def lookup_apps(app_ids, country=COUNTRY):
                 if not app_id:
                     continue
                 records[app_id] = {
+                    "name": item.get("trackName", "Unknown app"),
                     "developer": item.get("artistName") or item.get("sellerName") or "",
                     "price": float(item.get("price") or 0.0),
                     "url": item.get("trackViewUrl") or "",
@@ -456,6 +467,128 @@ def enrich_and_verify(apps, country=COUNTRY):
         merged["url"] = record["url"] or app["url"]
         kept.append(merged)
     return kept
+
+
+# --- Source 2: Apple's own top-paid chart + price-drop detection -----------
+#
+# iGeeksBlog is a hand-curated editorial list - useful, but it's scraped
+# HTML, and scraped HTML can (and, this week, did - three times) break in
+# ways that have nothing to do with whether any apps actually went free.
+# This second source is structurally immune to that failure mode: no HTML,
+# no markup to break. It auto-discovers popular paid apps from Apple's own
+# public top-paid chart feed, remembers each one's price between runs (in
+# CHART_STATE_FILE), and reports any that have dropped to $0.00 since the
+# last check - using the exact same iTunes Lookup API this script already
+# depends on for enrichment above, just called on a schedule instead of
+# once per scraped id.
+#
+# Trade-off worth being upfront about: this only sees apps popular enough
+# to be in the top CHART_LIMIT paid apps to begin with, so it won't catch
+# a niche app going free the way an editor hand-picking submissions might.
+# The two sources have different blind spots, which is the actual point
+# of having both rather than two attempts at the same thing.
+
+CHART_URL_TEMPLATE = "https://rss.applemarketingtools.com/api/v2/{country}/apps/top-paid/{limit}/apps.json"
+CHART_LIMIT = int(os.environ.get("CHART_LIMIT", "100"))
+CHART_FALLBACK_LIMIT = 100  # the endpoint informally 500s above ~100 as of 2026; see fetch_top_paid_ids()
+CHART_STATE_FILE = os.environ.get("CHART_STATE_FILE", "state/chart_candidates.json")
+CHART_MAX_TRACK_AGE_DAYS = int(os.environ.get("CHART_MAX_TRACK_AGE_DAYS", "21"))
+CHART_MAX_TRACKED_APPS = int(os.environ.get("CHART_MAX_TRACKED_APPS", "2000"))
+CHART_MAX_CONSECUTIVE_MISSES = 3
+
+
+def fetch_top_paid_ids(country=COUNTRY, limit=CHART_LIMIT):
+    """Returns a list of App Store id strings from Apple's top-paid chart
+    feed. Falls back to CHART_FALLBACK_LIMIT if the requested limit errors
+    out."""
+    tried = []
+    for this_limit in dict.fromkeys([limit, CHART_FALLBACK_LIMIT]):
+        tried.append(this_limit)
+        url = CHART_URL_TEMPLATE.format(country=country, limit=this_limit)
+        try:
+            resp = http_get(url)
+            data = resp.json()
+            results = data.get("feed", {}).get("results", [])
+            ids = [r["id"] for r in results if r.get("id")]
+            if ids:
+                if this_limit != limit:
+                    print(f"  (chart: used fallback limit={this_limit} after limit={limit} failed)", file=sys.stderr)
+                return ids
+            print(f"  chart fetch at limit={this_limit} returned 0 ids.", file=sys.stderr)
+        except (requests.RequestException, ValueError) as e:
+            print(f"  chart fetch at limit={this_limit} failed: {e}", file=sys.stderr)
+    print(f"  giving up on chart discovery this run (tried limits {tried}).", file=sys.stderr)
+    return []
+
+
+def discover_chart_gone_free(chart_state, country=COUNTRY):
+    """Folds this run's chart + lookup results into chart_state, prunes it,
+    and returns (newly_free_apps, updated_chart_state). An app only counts
+    as newly free if chart_state already had a price > 0 for it from a
+    previous run - first-ever observation of any app is a baseline, not
+    an event, same reasoning as the scraped-source dedup."""
+    chart_ids = fetch_top_paid_ids(country=country)
+    print(f"  chart: {len(chart_ids)} id(s) from today's top-paid chart.")
+    checked_ids = list(dict.fromkeys(list(chart_state.keys()) + chart_ids))
+    if not checked_ids:
+        return [], chart_state
+
+    fresh_records = lookup_apps(checked_ids, country=country)
+    print(f"  chart: got current prices for {len(fresh_records)}/{len(checked_ids)} tracked app(s).")
+
+    today = today_str()
+    new_state = dict(chart_state)
+    newly_free = []
+    for app_id in checked_ids:
+        record = fresh_records.get(app_id)
+        prior = new_state.get(app_id, {})
+        if record is not None:
+            if prior.get("price", 0) > 0 and record["price"] == 0:
+                newly_free.append({
+                    "id": app_id,
+                    "name": record["name"],
+                    "developer": record["developer"],
+                    "icon": record["icon"],
+                    "url": record["url"] or f"https://apps.apple.com/app/id{app_id}",
+                    "genre": record["genre"],
+                    "rating": record["rating"],
+                    "rating_count": record["rating_count"],
+                    "description": record["description"],
+                    "price_label": "Free",
+                    "source": "Apple Top-Paid Chart",
+                })
+            new_state[app_id] = {
+                "name": record["name"], "price": record["price"],
+                "first_seen": prior.get("first_seen", today), "last_checked": today, "misses": 0,
+            }
+        elif prior:
+            misses = prior.get("misses", 0) + 1
+            if misses >= CHART_MAX_CONSECUTIVE_MISSES:
+                new_state.pop(app_id, None)
+            else:
+                new_state[app_id] = {**prior, "misses": misses, "last_checked": today}
+
+    # Age-based prune, same reasoning as the scraped-source state: a
+    # candidate that's been tracked for weeks and never gone free is
+    # probably just a stable paid app - stop watching it to keep the
+    # state file bounded. Keyed off first_seen, not last_checked, for
+    # the same reason as the other state: every checked_id gets
+    # last_checked refreshed every run, so a last_checked cutoff would
+    # never fire.
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=CHART_MAX_TRACK_AGE_DAYS)).strftime("%Y-%m-%d")
+    for app_id in list(new_state.keys()):
+        entry = new_state[app_id]
+        if entry.get("price", 0) == 0:
+            continue
+        if entry.get("first_seen", today) < cutoff:
+            new_state.pop(app_id, None)
+
+    if len(new_state) > CHART_MAX_TRACKED_APPS:
+        evictable = sorted(new_state.keys(), key=lambda aid: new_state[aid].get("first_seen", today))
+        for aid in evictable[:len(new_state) - CHART_MAX_TRACKED_APPS]:
+            new_state.pop(aid, None)
+
+    return newly_free, new_state
 
 
 # --- Dedup state ------------------------------------------------------------
@@ -532,57 +665,93 @@ def price_badge(price_label):
     return label, sub
 
 
-def build_html(new_apps, timestamp, stats):
-    if not new_apps:
-        cards = "<p style='color:#555;'>Nothing new since the last check.</p>"
-    else:
-        card_rows = []
-        for app in new_apps:
-            rating_html = ""
-            if app.get("rating"):
-                rating_html = (
-                    f"<span style='color:#f5a623'>{escape(star_string(app['rating']))}</span> "
-                    f"<span style='color:#999'>{app['rating']:.1f} ({app.get('rating_count', 0):,})</span>"
-                )
-            icon_html = (
-                f"<img src='{escape(app['icon'])}' width='64' height='64' "
-                f"style='border-radius:14px;display:block' alt=''>"
-                if app.get("icon") else ""
-            )
-            badge, badge_sub = price_badge(app["price_label"])
-            genre_bits = " · ".join(x for x in [app.get("developer", ""), app.get("genre", "")] if x)
-            card_rows.append(f"""
-<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:680px;margin:0 0 14px;border:1px solid #eee;border-radius:12px;">
+# Palette read directly off a real screenshot of the actual product (light
+# theme: white background, near-black text, a clean blue used specifically
+# for buttons/links/active-states, and a separate green used specifically
+# for status pills like their "OK" badges) - an earlier version of this
+# guessed dark-mode-with-lime-accent from search-result thumbnails, which
+# turned out backwards on both counts. Kept as named constants so this
+# stays easy to retune if it needs correcting again.
+BG = "#F7F8FA"
+CARD_BG = "#FFFFFF"
+CARD_BORDER = "#E5E7EB"
+TEXT_PRIMARY = "#111827"
+TEXT_SECONDARY = "#6B7280"
+ACCENT = "#3B5BDB"       # buttons, links, active states - matches their "Run now" blue
+ACCENT_TEXT = "#FFFFFF"  # text on top of a solid ACCENT fill
+STAR_COLOR = "#F5A623"   # star ratings stay amber/gold regardless of brand color - near-universal convention
+SUCCESS_BG = "#DCFCE7"   # status pill background, matches their green "OK" badges
+SUCCESS_TEXT = "#15803D"  # status pill text
+
+
+def source_tag_html(source):
+    return f"<span style=\"color:{TEXT_SECONDARY};font-size:11px;text-transform:uppercase;letter-spacing:.04em;\">via {escape(source)}</span>"
+
+
+def render_app_card_html(app, card_style_extra=""):
+    """Renders one app as a card - shared by the real email (build_html)
+    and the standalone preview page, so the card itself (icon/name/price/
+    source) can never drift between the two. Only the page chrome around
+    it differs."""
+    rating_html = ""
+    if app.get("rating"):
+        rating_html = (
+            f"<span style='color:{STAR_COLOR}'>{escape(star_string(app['rating']))}</span> "
+            f"<span style='color:{TEXT_SECONDARY}'>{app['rating']:.1f} ({app.get('rating_count', 0):,})</span>"
+        )
+    icon_html = (
+        f"<img src='{escape(app['icon'])}' width='64' height='64' "
+        f"style='border-radius:16px;display:block' alt=''>"
+        if app.get("icon") else ""
+    )
+    badge, badge_sub = price_badge(app["price_label"])
+    genre_bits = " · ".join(x for x in [app.get("developer", ""), app.get("genre", "")] if x)
+    return f"""
+<table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:680px;margin:0 0 16px;background:{CARD_BG};border:1px solid {CARD_BORDER};border-radius:14px;box-shadow:0 1px 2px rgba(16,24,40,0.04);{card_style_extra}">
   <tr>
-    <td style="width:80px;padding:14px 0 14px 14px;vertical-align:top;">{icon_html}</td>
-    <td style="padding:14px;vertical-align:top;font-family:Arial,Helvetica,sans-serif;">
-      <div style="font-size:16px;font-weight:bold;color:#111;">
-        <a href="{escape(app['url'])}" style="color:#0a66c2;text-decoration:none;">{escape(app['name'])}</a>
+    <td style="width:88px;padding:20px 0 20px 20px;vertical-align:top;">{icon_html}</td>
+    <td style="padding:20px;vertical-align:top;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+      <div style="font-size:16px;font-weight:700;letter-spacing:-.01em;">
+        <a href="{escape(app['url'])}" style="color:{TEXT_PRIMARY};text-decoration:none;">{escape(app['name'])}</a>
       </div>
-      <div style="font-size:13px;color:#666;margin:2px 0 6px;">{escape(genre_bits)}</div>
-      <div style="font-size:13px;margin-bottom:6px;">{rating_html}</div>
-      <div style="font-size:13px;color:#333;line-height:1.4;">{escape(truncate(app.get('description', '')))}</div>
-      <div style="margin-top:8px;">
-        <span style="background:#e8f5e9;color:#1b5e20;font-weight:bold;padding:3px 8px;border-radius:6px;font-size:13px;">{badge}</span>
-        <span style="color:#999;margin-left:6px;font-size:12px;">{escape(badge_sub)}</span>
+      <div style="font-size:13px;color:{TEXT_SECONDARY};margin:4px 0 8px;">{escape(genre_bits)}</div>
+      <div style="font-size:13px;margin-bottom:8px;">{rating_html}</div>
+      <div style="font-size:13px;color:{TEXT_SECONDARY};line-height:1.5;">{escape(truncate(app.get('description', '')))}</div>
+      <div style="margin-top:14px;">
+        <span style="background:{SUCCESS_BG};color:{SUCCESS_TEXT};font-weight:600;padding:3px 10px;border-radius:6px;font-size:12px;">{badge}</span>
+        <span style="color:{TEXT_SECONDARY};margin-left:8px;font-size:12px;">{escape(badge_sub)}</span>
+        <span style="float:right;">{source_tag_html(app.get('source', ''))}</span>
       </div>
     </td>
   </tr>
-</table>""")
-        cards = "\n".join(card_rows)
+</table>"""
+
+
+def build_html(new_apps, timestamp, stats):
+    if not new_apps:
+        cards = f"<p style='color:{TEXT_SECONDARY};font-size:14px;'>Nothing new since the last check.</p>"
+    else:
+        cards = "\n".join(render_app_card_html(app) for app in new_apps)
 
     return f"""\
 <html>
-<body style="margin:0; padding:20px; background:#f4f4f4; font-family:Arial,Helvetica,sans-serif;">
-  <h1 style="color:#1a5fb4;">iOS Apps Gone Free</h1>
-  <p style="color:#555;">Checked {escape(timestamp)} · {stats['scraped']} app(s) found today, {stats['new']} new, {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days</p>
-  {cards}
-  <p style="color:#999; font-size:12px; margin-top:24px;">
-    Source: <a href="{escape(IGEEKSBLOG_URL)}">iGeeksBlog - Today's Apps Gone Free</a>, cross-checked against
-    Apple's iTunes Lookup API (country={escape(COUNTRY)}) · "FREE+" means the app itself was already free to
-    download and a premium/subscription tier has been unlocked for now, not that the whole app was a paid
-    download · Promotions can end at any time - check the App Store link before assuming it's still free.
-  </p>
+<head><meta name="color-scheme" content="light"></head>
+<body style="margin:0; padding:32px 20px; background:{BG}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+  <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:720px;margin:0 auto;">
+    <tr><td>
+      <h1 style="color:{TEXT_PRIMARY};font-size:28px;font-weight:800;letter-spacing:-.02em;margin:0 0 8px;">iOS Apps Gone Free</h1>
+      <p style="color:{TEXT_SECONDARY};font-size:14px;margin:0 0 24px;">Checked {escape(timestamp)} &middot; {stats.get('scraped', 0)} from iGeeksBlog + {stats.get('chart', 0)} from Apple's top-paid chart &middot; {stats['new']} new &middot; {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days</p>
+      {cards}
+      <p style="color:{TEXT_SECONDARY}; font-size:12px; line-height:1.6; margin-top:28px;">
+        Sources: <a href="{escape(IGEEKSBLOG_URL)}" style="color:{ACCENT};">iGeeksBlog - Today's Apps Gone Free</a>
+        (hand-curated) and Apple's own top-paid chart feed (auto-discovered, tracked for price drops) &middot;
+        both cross-checked against Apple's iTunes Lookup API (country={escape(COUNTRY)}) &middot; "FREE+" means
+        the app itself was already free to download and a premium/subscription tier has been unlocked for now,
+        not that the whole app was a paid download &middot; Promotions can end at any time - check the App Store
+        link before assuming it's still free.
+      </p>
+    </td></tr>
+  </table>
 </body>
 </html>"""
 
@@ -590,8 +759,8 @@ def build_html(new_apps, timestamp, stats):
 def build_plain_text(new_apps, timestamp, stats):
     lines = [
         f"iOS Apps Gone Free - checked {timestamp}",
-        f"{stats['scraped']} app(s) found today, {stats['new']} new, "
-        f"{stats['repeat']} already sent within the last {COOLDOWN_DAYS} days",
+        f"{stats.get('scraped', 0)} from iGeeksBlog + {stats.get('chart', 0)} from Apple's top-paid chart, "
+        f"{stats['new']} new, {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days",
         "",
     ]
     if not new_apps:
@@ -599,7 +768,7 @@ def build_plain_text(new_apps, timestamp, stats):
     else:
         for app in new_apps:
             badge, badge_sub = price_badge(app["price_label"])
-            lines.append(f"- {app['name']} ({badge} - {badge_sub})")
+            lines.append(f"- {app['name']} ({badge} - {badge_sub}) [via {app.get('source', '?')}]")
             meta_bits = " | ".join(x for x in [app.get("developer", ""), app.get("genre", "")] if x)
             if app.get("rating"):
                 meta_bits += f" | {app['rating']:.1f}* ({app.get('rating_count', 0)})"
@@ -610,6 +779,104 @@ def build_plain_text(new_apps, timestamp, stats):
             lines.append(f"  {app['url']}")
             lines.append("")
     return "\n".join(lines)
+
+
+def build_preview_page_html(new_apps, timestamp, stats):
+    """A standalone preview webpage - icon sidebar + top search bar + main
+    content area, modeled on a real screenshot of the actual product (an
+    app-shell layout, not a marketing landing page - that was the wrong
+    reference the first time around). This is NOT what gets emailed (see
+    build_html() for that, which stays a plain, conservative wrapper for
+    email-client compatibility) - it's a nicer way to browse the same
+    underlying cards in an actual browser. The cards themselves come from
+    the exact same render_app_card_html() the real email uses, so what
+    you see here is never cosmetically different from what would actually
+    be emailed - only the chrome around it is."""
+    if new_apps:
+        card_grid = "\n".join(
+            f'<div style="break-inside:avoid;margin-bottom:16px;">{render_app_card_html(app)}</div>'
+            for app in new_apps
+        )
+    else:
+        card_grid = f"<p style='color:{TEXT_SECONDARY};font-size:14px;'>Nothing new since the last check.</p>"
+
+    stat_cards = "".join(f"""
+    <div style="background:{CARD_BG};border:1px solid {CARD_BORDER};border-radius:12px;padding:16px 20px;flex:1;min-width:130px;">
+      <div style="font-size:26px;font-weight:700;color:{TEXT_PRIMARY};letter-spacing:-.02em;">{value}</div>
+      <div style="font-size:12px;color:{TEXT_SECONDARY};margin-top:2px;">{label}</div>
+    </div>""" for value, label in [
+        (stats["new"], "New today"),
+        (stats.get("scraped", 0), "From iGeeksBlog"),
+        (stats.get("chart", 0), "From Apple charts"),
+        (f"{COOLDOWN_DAYS}d", "Repeat cooldown"),
+    ])
+
+    sidebar_icons = "".join(f"""
+    <div style="display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 8px;border-radius:10px;{'background:#EEF1FF;color:' + ACCENT if active else 'color:' + TEXT_SECONDARY};">
+      <div style="font-size:18px;line-height:1;">{icon}</div>
+      <div style="font-size:10px;">{label}</div>
+    </div>""" for icon, label, active in [
+        ("&#8962;", "Home", False), ("&#128229;", "Digest", True),
+        ("&#128279;", "Sources", False), ("&#9881;", "Settings", False),
+    ])
+
+    return f"""\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iOS Apps Gone Free - Preview</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; background:{BG}; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif; color:{TEXT_PRIMARY}; }}
+  .shell {{ display:flex; min-height:100vh; }}
+  .sidebar {{ width:76px; background:{CARD_BG}; border-right:1px solid {CARD_BORDER}; padding:16px 8px; display:flex; flex-direction:column; align-items:center; gap:6px; flex-shrink:0; }}
+  .sidebar-logo {{ width:32px; height:32px; border-radius:8px; background:{ACCENT}; color:{ACCENT_TEXT}; display:flex; align-items:center; justify-content:center; font-weight:800; margin-bottom:12px; }}
+  .main {{ flex:1; min-width:0; }}
+  .topbar {{ display:flex; align-items:center; justify-content:space-between; padding:14px 28px; background:{CARD_BG}; border-bottom:1px solid {CARD_BORDER}; }}
+  .topbar-brand {{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:15px; }}
+  .search {{ flex:1; max-width:420px; margin:0 24px; padding:9px 14px; background:{BG}; border:1px solid {CARD_BORDER}; border-radius:8px; color:{TEXT_SECONDARY}; font-size:13px; display:flex; justify-content:space-between; }}
+  .topbar-badge {{ background:{SUCCESS_BG}; color:{SUCCESS_TEXT}; font-weight:700; font-size:11px; padding:4px 10px; border-radius:6px; }}
+  .content {{ max-width:900px; margin:0 auto; padding:32px 28px 56px; }}
+  .content h1 {{ font-size:24px; font-weight:700; letter-spacing:-.02em; margin:0 0 6px; }}
+  .content > p {{ color:{TEXT_SECONDARY}; font-size:14px; margin:0 0 24px; }}
+  .stats-row {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:32px; }}
+  .grid {{ column-count:2; column-gap:16px; }}
+  @media (max-width:720px) {{ .grid {{ column-count:1; }} .sidebar {{ display:none; }} .search {{ display:none; }} }}
+  .footer {{ max-width:900px; margin:0 auto; padding:24px 28px 0; color:{TEXT_SECONDARY}; font-size:12px; line-height:1.6; border-top:1px solid {CARD_BORDER}; margin-top:8px; }}
+  .footer a {{ color:{ACCENT}; }}
+</style>
+</head>
+<body>
+  <div class="shell">
+    <div class="sidebar">
+      <div class="sidebar-logo">A</div>
+      {sidebar_icons}
+    </div>
+    <div class="main">
+      <div class="topbar">
+        <div class="topbar-brand">Apps Gone Free</div>
+        <div class="search"><span>Search apps...</span><span>&#8984;K</span></div>
+        <div class="topbar-badge">PREVIEW</div>
+      </div>
+      <div class="content">
+        <h1>Today's digest</h1>
+        <p>Checked {escape(timestamp)} &middot; {stats['new']} new since the last check, {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days.</p>
+        <div class="stats-row">{stat_cards}</div>
+        <div class="grid">{card_grid}</div>
+        <div class="footer">
+          This is a local preview generated by <code>python apps_gone_free_emailer.py preview</code> from
+          sample data - not a real digest. The cards above use the exact same rendering as the real email;
+          only this sidebar/topbar chrome is preview-only, since actual emails don't have navigation. Sources:
+          <a href="{escape(IGEEKSBLOG_URL)}">iGeeksBlog</a> and Apple's top-paid chart feed, both cross-checked
+          against Apple's iTunes Lookup API.
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>"""
 
 
 def resolve_timestamp():
@@ -625,30 +892,44 @@ def resolve_timestamp():
 # --- Commands -----------------------------------------------------------
 
 def cmd_generate():
+    print(f"apps_gone_free_emailer.py version: {SCRIPT_VERSION}")
     if os.path.exists(EMAIL_DIR):
         for f in os.listdir(EMAIL_DIR):
             os.remove(os.path.join(EMAIL_DIR, f))
     os.makedirs(EMAIL_DIR, exist_ok=True)
 
     old_state = load_state()
+    old_chart_state = load_state(CHART_STATE_FILE)
 
     print("Fetching source(s) ...")
     scraped = fetch_all_sources()
-    print(f"  {len(scraped)} app(s) total after merging sources.")
+    print(f"  {len(scraped)} app(s) total after merging scraped sources.")
+    verified = enrich_and_verify(scraped) if scraped else []
+    if scraped:
+        print(f"  {len(verified)}/{len(scraped)} app(s) kept after cross-check.")
 
-    if not scraped:
-        print("0 apps scraped from every source this run - probably a scraper/markup problem, not a quiet day. "
-              "Aborting without sending or touching state.", file=sys.stderr)
+    print(f"Checking Apple's top-paid chart (country={COUNTRY}) ...")
+    chart_new, new_chart_state = discover_chart_gone_free(old_chart_state)
+    print(f"  {len(chart_new)} app(s) newly free via the chart.")
+    save_state(new_chart_state, CHART_STATE_FILE)  # save regardless of whether an email goes out
+
+    combined = verified + chart_new
+    if not scraped and not new_chart_state:
+        # Both sources have literally nothing: the scrape found 0 apps AND
+        # the chart source has never successfully tracked a single
+        # candidate (this run's chart fetch failed with no prior state to
+        # fall back on either). That's a real problem worth flagging
+        # loudly, distinct from "nothing NEW today" (normal, most days,
+        # handled further down) - don't touch state.
+        print("Both sources found 0 apps this run - probably a scraper/markup or API problem, "
+              "not a quiet day. Aborting without sending or touching the notified-apps state.",
+              file=sys.stderr)
         with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
-            json.dump({"send": False, "scraped": 0, "new": 0, "repeat": 0}, f)
+            json.dump({"send": False, "scraped": 0, "chart": 0, "new": 0, "repeat": 0}, f)
         return
 
-    print(f"Cross-checking/enriching via iTunes Lookup (country={COUNTRY}) ...")
-    verified = enrich_and_verify(scraped)
-    print(f"  {len(verified)}/{len(scraped)} app(s) kept after verification.")
-
-    new_apps, repeat_apps = split_new_and_repeat(verified, old_state)
-    stats = {"scraped": len(verified), "new": len(new_apps), "repeat": len(repeat_apps)}
+    new_apps, repeat_apps = split_new_and_repeat(combined, old_state)
+    stats = {"scraped": len(verified), "chart": len(chart_new), "new": len(new_apps), "repeat": len(repeat_apps)}
     print(f"Result: {stats['new']} new, {stats['repeat']} repeat (already notified within {COOLDOWN_DAYS} days).")
 
     new_state = update_state(old_state, new_apps)
@@ -722,14 +1003,73 @@ def cmd_send():
     print(f"Sent to {APPS_RECIPIENT}!")
 
 
+def cmd_preview():
+    """Generates preview.html (a full nav/hero/grid webpage, see
+    build_preview_page_html()) and preview.txt (build_plain_text(), same
+    as a real email) from sample data. The individual app cards on
+    preview.html come from render_app_card_html() - the exact same
+    function build_html() uses for real emails - so a card can never look
+    cosmetically different here than it would in an actual email; only
+    the surrounding nav/hero/grid chrome is preview-only, since real
+    emails don't have navigation bars. Sample apps mix both sources and
+    both price labels on purpose, to show the visual variety a real
+    digest can have. Doesn't touch state, doesn't send anything, doesn't
+    hit the network."""
+    sample_apps = [
+        {
+            "id": "6785703404", "name": "ASABlocker", "developer": "Solo Dev",
+            "icon": "https://is1-ssl.mzstatic.com/image/thumb/PurpleSource221/v4/2b/4d/3e/2b4d3e28-51d1-9eb7-b39e-d6e0fdd345a9/Placeholder.mill/200x200bb-75.png",
+            "url": "https://apps.apple.com/app/id6785703404", "genre": "Utilities",
+            "rating": 4.2, "rating_count": 340,
+            "description": "Blocks Apple Search Ads from cluttering App Store search results.",
+            "price_label": "Free", "source": "iGeeksBlog",
+        },
+        {
+            "id": "6785424413", "name": "Authenticator App Vault+", "developer": "Vault Labs",
+            "icon": "https://is1-ssl.mzstatic.com/image/thumb/PurpleSource221/v4/4e/ea/cc/4eeacccf-446f-c8c6-cfff-9ceb298a1399/Placeholder.mill/200x200bb-75.png",
+            "url": "https://apps.apple.com/app/id6785424413", "genre": "Utilities",
+            "rating": 4.7, "rating_count": 2103,
+            "description": "Two-factor authenticator with iCloud sync and Face ID lock.",
+            "price_label": "Free+", "source": "iGeeksBlog",
+        },
+        {
+            "id": "6789931132", "name": "VRAMFit: LLM Calculator", "developer": "VRAMFit",
+            "icon": "https://is1-ssl.mzstatic.com/image/thumb/PurpleSource211/v4/1b/90/92/1b909286-d073-1d96-2f47-7d0e093ec1af/Placeholder.mill/200x200bb-75.png",
+            "url": "https://apps.apple.com/app/id6789931132", "genre": "Developer Tools",
+            "rating": 4.9, "rating_count": 87,
+            "description": "Estimates GPU memory needed to run a given LLM locally.",
+            "price_label": "Free+", "source": "iGeeksBlog",
+        },
+        {
+            "id": "0000000001", "name": "[SAMPLE] Focus Timer Pro", "developer": "Placeholder Co",
+            "icon": "", "url": "https://apps.apple.com/app/id0000000001", "genre": "Productivity",
+            "rating": 4.8, "rating_count": 15420,
+            "description": "Not a real listing - placeholder data to show how a chart-discovered "
+                            "app (no icon guaranteed, since this source has no scraped image) renders.",
+            "price_label": "Free", "source": "Apple Top-Paid Chart",
+        },
+    ]
+    stats = {"scraped": 3, "chart": 1, "new": len(sample_apps), "repeat": 2}
+    _, timestamp = resolve_timestamp()
+    html = build_preview_page_html(sample_apps, timestamp, stats)
+    text = build_plain_text(sample_apps, timestamp, stats)
+    with open("preview.html", "w", encoding="utf-8") as f:
+        f.write(html)
+    with open("preview.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+    print("Wrote preview.html and preview.txt (sample data, no state touched, nothing sent/scraped).")
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("generate", "send"):
-        print("Usage: python apps_gone_free_emailer.py [generate|send]", file=sys.stderr)
+    if len(sys.argv) != 2 or sys.argv[1] not in ("generate", "send", "preview"):
+        print("Usage: python apps_gone_free_emailer.py [generate|send|preview]", file=sys.stderr)
         sys.exit(1)
     if sys.argv[1] == "generate":
         cmd_generate()
-    else:
+    elif sys.argv[1] == "send":
         cmd_send()
+    else:
+        cmd_preview()
 
 
 if __name__ == "__main__":
