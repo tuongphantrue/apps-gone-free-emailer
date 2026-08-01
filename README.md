@@ -12,32 +12,48 @@ dedup-via-state-branch trick.
 
 [#important-read-this-before-relying-on-it](#important-read-this-before-relying-on-it)
 
-A lot of the sites people remember for this have quietly died. Before
-building this, I checked what's actually still alive in 2026:
+A lot of the sites people remember for this have quietly died. Two
+rounds of checking what's actually still alive in 2026:
 
 | Site | Status |
 | --- | --- |
 | AppShopper.com | Shut down 2021-06-30. |
 | iOSnoops.com | Was still posting in 2023; its own homepage now just says "we have decided to shut down the site." |
-| AppAdvice.com "Apps Gone Free" | Stopped being updated in early 2026 (Apple tightened App Review enforcement on free-to-paid price-flip promos). The page is still online but frozen on a mid-January 2026 post. |
-| AppRaven (appraven.net) | Still active, but it's a client-side JS app with no server-rendered HTML - nothing for a plain scraper to read. |
-| AppsHunter.io, 148apps.com | Still active, but general app catalogs / gaming-news sites, not a clean "gone free today" list. |
-| **iGeeksBlog.com** | **Still active and actually updated daily** - one bookmarkable page it edits in place, not per-day archive posts. |
+| AppAdvice.com "Apps Gone Free" | Stopped being updated in early 2026. Page still online but frozen on a mid-January 2026 post. |
+| AppRaven (appraven.net) | Active, but pure client-side JS - no server-rendered HTML for a plain scraper to read. |
+| AppSliced.co | Now just redirects to AppRaven - same dead end. |
+| AppsHunter.io, 148apps.com | Active, but general app catalogs / gaming-news sites, not a clean "gone free today" list. |
+| AppStore-Discounts.com | Would've been ideal - 770K+ apps, hourly refresh via Apple's own API, explicitly tracks apps hitting 100% free - but its `robots.txt` disallows automated access. Skipped on principle. |
+| PSprices.com | Has an RSS feed and clean pages, but turns out to be a console/PC gaming price tracker (PlayStation, Xbox, Switch) with iOS as a minor secondary platform - wrong scope. |
+| Reddit r/AppHookup | Active (204k members), and individual posts do follow a `[iOS] [App] [$X → Free]` bracket convention - but it mixes multi-day roundup posts with individual ones, spans many platforms, and reliable JSON API access without auth is genuinely uncertain in 2026. Didn't clear the bar to ship. |
+| **iGeeksBlog.com** | **Still active and actually updated daily** - one bookmarkable page it edits in place. |
 
-So this scrapes iGeeksBlog's [Today's Apps Gone
-Free](https://www.igeeksblog.com/paid-iphone-apps-gone-free/) page, the
-same way tech-price-mailer scrapes MemoryZone.vn. Every app it finds is
-then cross-checked against Apple's own iTunes Lookup API - a plain
-"Free" listing (was a normal paid download, now $0) that no longer shows
-$0.00 there gets dropped as stale rather than emailed. "Free+" listings
-(the app was already free to download and a premium/subscription tier
-got unlocked for now) can't be verified the same way, since a free
-download always shows $0.00 whether or not the unlock promo is still
-live - those go out on iGeeksBlog's own editorial word.
+Given how thin that list is, this doesn't rely on iGeeksBlog alone -
+it runs **two independent sources** and merges whatever either one
+finds:
 
-Because it's one hand-curated site, this will only ever catch what that
-site picks - it's not an exhaustive scan of the whole App Store. See
-"Adding another source" below if you find a second site worth adding.
+1. **iGeeksBlog scrape** - the hand-curated list above, the same way
+   tech-price-mailer scrapes MemoryZone.vn. Every app it finds is
+   cross-checked against Apple's own iTunes Lookup API - a plain
+   "Free" listing (was a normal paid download, now $0) that no longer
+   shows $0.00 there gets dropped as stale rather than emailed.
+   "Free+" listings (already free to download, with a premium tier
+   unlocked for now) can't be verified the same way, since a free
+   download always shows $0.00 regardless - those go out on
+   iGeeksBlog's own editorial word.
+2. **Apple's own top-paid chart feed** - auto-discovers popular paid
+   apps directly from Apple (`rss.applemarketingtools.com`, no
+   scraping involved at all), remembers each one's price between runs,
+   and reports any that drop to $0.00. Structurally immune to the kind
+   of HTML/markup breakage that hit the scraper three separate times
+   while this was being built - there's no page to change.
+
+The two sources have different blind spots on purpose: iGeeksBlog
+catches smaller/niche apps a human bothered to feature; the chart
+catches popular apps regardless of whether any editor ever wrote about
+them. Either one failing (site down, markup changed, Apple's API
+having a bad day) no longer means an empty inbox - see "Both sources
+failing" in Troubleshooting for the one case that still does.
 
 This is a personal notification tool, not a guarantee of catching every
 app that goes free, and not purchase advice - always check the App
@@ -149,29 +165,78 @@ These are optional environment variables you can add to the "Generate
 email" step in the workflow (or export locally):
 
 ```
-COUNTRY: "us"                        # App Store storefront for the iTunes Lookup cross-check
+COUNTRY: "us"                        # App Store storefront for both sources
 COOLDOWN_DAYS: "21"                  # don't re-email the same app within this many days
 ALWAYS_SEND: "false"                 # "true" = still send a "nothing new" email every run
 TIMEZONE: "Asia/Ho_Chi_Minh"         # only affects the timestamp shown in the email
 STATE_FILE: "state/notified.json"    # dedup state file path
 IGEEKSBLOG_URL: "https://www.igeeksblog.com/paid-iphone-apps-gone-free/"
 ALLOW_INSECURE_SSL_FALLBACK: "false" # last-resort TLS bypass
+
+# Apple top-paid chart source
+CHART_LIMIT: "100"                        # apps to pull from the chart per run (informal ceiling as of 2026)
+CHART_STATE_FILE: "state/chart_candidates.json"  # separate state file - price history for chart-discovered apps
+CHART_MAX_TRACK_AGE_DAYS: "21"            # stop watching a chart candidate after this long if it never goes free
+CHART_MAX_TRACKED_APPS: "2000"            # hard cap on the chart candidate state file's size
 ```
 
 ## Adding another source
 
 [#adding-another-source](#adding-another-source)
 
-`SOURCES` near the top of `apps_gone_free_emailer.py` is a list of
-`{"name", "url", "parser"}` - currently just the one entry for
-iGeeksBlog. `fetch_all_sources()` already fetches every entry in that
-list, tolerates any one of them failing, and dedupes apps by App Store
-id across sources. To add a second site, write a
-`parse_<site>(html) -> [{"id", "name", "icon", "url", "price_label"}, ...]`
-function (see `parse_igeeksblog()` for the shape) and append it to
-`SOURCES`. Worth grabbing real page source (view-source, not a
-text/markdown rendering of it) before writing the parser - see
-"Troubleshooting" below for exactly why that distinction mattered here.
+Two different extension points, depending on what you find:
+
+- **Another scraped listing site**: `SOURCES` near the top of
+  `apps_gone_free_emailer.py` is a list of `{"name", "url", "parser"}` -
+  currently just the one entry for iGeeksBlog. `fetch_all_sources()`
+  already fetches every entry in that list, tolerates any one of them
+  failing, and dedupes apps by App Store id across sources. Write a
+  `parse_<site>(html) -> [{"id", "name", "icon", "url", "price_label"}, ...]`
+  function (see `parse_igeeksblog()` for the shape) and append it to
+  `SOURCES`. Worth grabbing real page source (view-source, not a
+  text/markdown rendering of it) before writing the parser - see
+  "Troubleshooting" below for exactly why that distinction mattered here.
+- **Another official API, same shape as the chart source**: if you find
+  another store's or service's own public API worth tracking the same
+  way (auto-discover candidates, remember prices, report drops to $0),
+  `discover_chart_gone_free()` is the pattern to copy - it's independent
+  of `SOURCES` entirely and merges into `cmd_generate()` alongside it.
+
+## Visual design
+
+[#visual-design](#visual-design)
+
+Modeled on rework.com's actual UI - a **light** theme (white/near-white
+background, near-black text) with a clean **blue** accent (`#3B5BDB`)
+used specifically for buttons/links/active states, and a separate
+**green** used specifically for status pills (their "OK" badges - this
+project's "FREE" badge borrows that same pattern). Named constants
+`BG`, `CARD_BG`, `ACCENT`, `SUCCESS_BG`, etc. near the top of the file,
+easy to retune in one place.
+
+Worth being honest about how this got nailed down: rework.com is a
+JS-only SPA with no server-rendered markup to read exact values from,
+so the first attempt was built from search-result thumbnails and got
+it backwards on both counts - guessed a dark background with a bright
+lime accent. It took an actual screenshot of the real product (a
+logged-in settings page, not the marketing site) to see the real
+pattern: light theme, blue for interactive elements, green reserved for
+status. If this is ever off again, a real screenshot is a much faster
+way to fix it than another round of image search.
+
+There are two templates, on purpose:
+
+- **`build_html()`** - what actually gets emailed. Stays a plain
+  wrapper (title, stats line, cards, footer) with no nav/sidebar chrome,
+  because it has to survive being rendered by Gmail/Outlook/etc., which
+  don't reliably support modern CSS.
+- **`build_preview_page_html()`** - what `preview.html` uses. A fuller
+  app-shell UI - icon sidebar, top search bar, dashboard-style stat
+  cards, a responsive two-column grid - since a browser has none of an
+  email client's constraints. Individual app cards come from the shared
+  `render_app_card_html()`, the same function `build_html()` uses, so
+  the cards themselves are guaranteed identical between the two - only
+  the surrounding chrome (sidebar/topbar/grid vs. plain stack) differs.
 
 ## Notes
 
@@ -185,6 +250,12 @@ text/markdown rendering of it) before writing the parser - see
   to **Settings -> Actions -> General -> Workflow permissions** in your
   repo and select **"Read and write permissions"**, then re-run the
   workflow.
+- Every `generate` run prints `apps_gone_free_emailer.py version: ...`
+  as its very first log line (`SCRIPT_VERSION` near the top of the
+  file, bumped whenever the parser/heading logic changes meaningfully).
+  If something's misbehaving and you're not sure whether the fix you
+  just applied actually made it into the run, this is the fast way to
+  check without diffing file contents by hand.
 - GitHub Actions free tier includes 2,000 minutes/month for private repos.
 - You can also trigger it manually anytime via the "Run workflow" button.
 - Worth checking iGeeksBlog's current `robots.txt` / terms before
@@ -195,14 +266,27 @@ text/markdown rendering of it) before writing the parser - see
   server for a page that only changes about once a day.
 - This is a personal notification tool, not investment or purchase advice.
 
-### Troubleshooting: a run logs "0 apps scraped from every source"
+### Troubleshooting: a run logs "Both sources found 0 apps this run"
 
-[#troubleshooting-a-run-logs-0-apps-scraped-from-every-source](#troubleshooting-a-run-logs-0-apps-scraped-from-every-source)
+[#troubleshooting-a-run-logs-both-sources-found-0-apps-this-run](#troubleshooting-a-run-logs-both-sources-found-0-apps-this-run)
 
-This happened twice during testing, and the two incidents pointed at
+This is the only case where nothing gets emailed *and* state is left
+untouched entirely - both the scrape and the chart discovery came back
+with genuinely nothing, not just nothing new. Two independent things
+would both have to be broken at once for this to fire, so it's worth
+checking the log for which one(s) actually failed: the scrape logs its
+own reason (see below), and the chart source logs `chart fetch at
+limit=N failed: ...` if `rss.applemarketingtools.com` itself is
+unreachable or erroring.
+
+### Troubleshooting: iGeeksBlog specifically parses to 0 apps
+
+[#troubleshooting-igeeksblog-specifically-parses-to-0-apps](#troubleshooting-igeeksblog-specifically-parses-to-0-apps)
+
+This happened three times during testing, and the incidents pointed at
 different things - worth the full history rather than just "it's fixed
-now," since the second one is exactly why the debug-artifact step below
-exists.
+now," since the pattern across them is exactly why the debug-artifact
+step below exists.
 
 **First incident:** fetching `igeeksblog.com` directly (outside the
 workflow) showed what looked like the page's content and structure
@@ -258,6 +342,22 @@ absolute last resort. The trimmed fixture is retired; the current test
 suite runs against the complete page structure specifically so a
 same-shaped bug can't hide in whatever got left out of an "obviously
 irrelevant" trim next time either.
+
+## Previewing the email design
+
+[#previewing-the-email-design](#previewing-the-email-design)
+
+```
+python apps_gone_free_emailer.py preview
+```
+
+Writes `preview.html` / `preview.txt` from sample data through the real
+`build_html()` / `build_plain_text()` functions - no network calls, no
+state touched, nothing sent. Open `preview.html` in a browser any time
+you want to check what the design actually looks like, including after
+editing the colors/layout in `build_html()` - since it goes through the
+real template code rather than a hand-copied mockup, it can't drift out
+of sync with what an actual email looks like.
 
 ## Running locally instead
 
