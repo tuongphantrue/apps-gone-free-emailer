@@ -134,7 +134,7 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
 # Printed at the start of every `generate` run specifically so a log is
 # self-describing about which fix actually ran, rather than needing to
 # diff file contents by hand to answer "is this the latest version?"
-SCRIPT_VERSION = "2026-07-31.7 (corrected light theme + blue accent from real screenshot)"
+SCRIPT_VERSION = "2026-08-01.8 (icon rehosting via icon-assets branch)"
 
 COUNTRY = os.environ.get("COUNTRY", "us").strip().lower()
 STATE_FILE = os.environ.get("STATE_FILE", "state/notified.json")
@@ -889,6 +889,50 @@ def resolve_timestamp():
     return now, now.strftime("%H:%M %d/%m/%Y")
 
 
+# --- Icon rehosting (mirrors 9gag-meme-emailer's asset-publishing pattern) -
+#
+# App icons already come from Apple's own CDN (mzstatic.com), which is
+# built for exactly this kind of external hotlinking - unlike a source
+# where rehosting solves a real problem, this is being done for
+# consistency with the rest of this project family rather than necessity.
+# See README for that discussion. Mirrors the shape exactly: download to a
+# local directory, the workflow publishes that directory to a dedicated
+# branch and waits for raw.githubusercontent.com to catch up, then the
+# email is sent referencing the new URLs.
+
+ICON_ASSETS_DIR = os.environ.get("ICON_ASSETS_DIR", "")  # set by the workflow; empty = rehosting disabled
+ICON_ASSETS_BRANCH = os.environ.get("ICON_ASSETS_BRANCH", "icon-assets")
+
+
+def rehost_icons(apps):
+    """Downloads each app's icon into ICON_ASSETS_DIR and rewrites
+    app['icon'] to the future raw.githubusercontent.com URL a workflow
+    step will publish it to. No-ops (leaves the original CDN URL alone)
+    unless both ICON_ASSETS_DIR and GITHUB_REPOSITORY (set automatically
+    by GitHub Actions) are present - so local runs and `preview` are
+    unaffected and keep making zero network calls beyond what they
+    already did. Tolerant of individual download failures - falls back
+    to the original CDN URL for that one app rather than breaking the
+    whole run over one bad icon fetch."""
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not ICON_ASSETS_DIR or not repo:
+        return apps
+    os.makedirs(ICON_ASSETS_DIR, exist_ok=True)
+    for app in apps:
+        if not app.get("icon"):
+            continue
+        try:
+            resp = http_get(app["icon"])
+            ext = os.path.splitext(app["icon"].split("?")[0])[1] or ".png"
+            filename = f"{app['id']}{ext}"
+            with open(os.path.join(ICON_ASSETS_DIR, filename), "wb") as f:
+                f.write(resp.content)
+            app["icon"] = f"https://raw.githubusercontent.com/{repo}/{ICON_ASSETS_BRANCH}/{filename}"
+        except requests.RequestException as e:
+            print(f"  couldn't rehost icon for {app['name']!r}: {e} - leaving original CDN URL", file=sys.stderr)
+    return apps
+
+
 # --- Commands -----------------------------------------------------------
 
 def cmd_generate():
@@ -947,6 +991,7 @@ def cmd_generate():
     else:
         subject = f"iOS Apps Gone Free - nothing new today - {now.strftime('%d/%m/%Y %H:%M')}"
 
+    rehost_icons(new_apps)  # no-op outside GitHub Actions - see function docstring
     html_body = build_html(new_apps, timestamp, stats)
     text_body = build_plain_text(new_apps, timestamp, stats)
 
