@@ -47,8 +47,12 @@ jobs:
       - name: Generate email
         env:
           STATE_FILE: state-wt/state/notified.json
+          CHART_STATE_FILE: state-wt/state/chart_candidates.json
+          ICON_ASSETS_DIR: icon-assets
+          ICON_ASSETS_BRANCH: icon-assets
           COUNTRY: "us"
           COOLDOWN_DAYS: "21"
+          CHART_LIMIT: "100"
         run: python apps_gone_free_emailer.py generate
 
       # Only exists if a source parsed to 0 apps this run (see fetch_all_sources()
@@ -62,6 +66,46 @@ jobs:
           path: debug/
           if-no-files-found: ignore
           retention-days: 14
+
+      # Same pattern as 9gag-meme-emailer's meme-assets branch: icons downloaded
+      # during "Generate email" (see rehost_icons() in apps_gone_free_emailer.py)
+      # get published here via the same worktree trick as the state branch above,
+      # except icons ACCUMULATE across runs rather than being overwritten each
+      # time - old emails still need their images to resolve later. A no-op
+      # (nothing to publish) whenever nothing new went out this run.
+      - name: Publish images to the icon-assets branch
+        run: |
+          if [ -d icon-assets ] && [ "$(ls -A icon-assets 2>/dev/null)" ]; then
+            if git ls-remote --exit-code --heads origin icon-assets >/dev/null 2>&1; then
+              git fetch origin icon-assets:icon-assets
+              git worktree add icon-wt icon-assets
+            else
+              git worktree add --orphan -B icon-assets icon-wt
+              find icon-wt -mindepth 1 -not -path 'icon-wt/.git*' -delete
+            fi
+            cp icon-assets/* icon-wt/
+            cd icon-wt
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No new icons to publish this run."
+            else
+              git commit -q -m "Add app icons [skip ci]"
+              git push -q origin icon-assets
+            fi
+            cd ..
+            git worktree remove icon-wt --force
+          else
+            echo "No icons downloaded this run (nothing new, or every rehost attempt failed) - skipping publish."
+          fi
+
+      - name: Wait for raw.githubusercontent.com to serve the new files
+        run: |
+          if [ -d icon-assets ] && [ "$(ls -A icon-assets 2>/dev/null)" ]; then
+            echo "Waiting 30s for raw.githubusercontent.com to catch up..."
+            sleep 30
+          else
+            echo "No new icons published - skipping wait."
+          fi
 
       - name: Send email
         env:
