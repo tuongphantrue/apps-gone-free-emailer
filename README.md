@@ -178,6 +178,10 @@ CHART_LIMIT: "100"                        # apps to pull from the chart per run 
 CHART_STATE_FILE: "state/chart_candidates.json"  # separate state file - price history for chart-discovered apps
 CHART_MAX_TRACK_AGE_DAYS: "21"            # stop watching a chart candidate after this long if it never goes free
 CHART_MAX_TRACKED_APPS: "2000"            # hard cap on the chart candidate state file's size
+
+# Icon rehosting (see "Icon hosting" below - only activates inside GitHub Actions)
+ICON_ASSETS_DIR: ""      # local dir to save downloaded icons into; empty (default) = rehosting disabled
+ICON_ASSETS_BRANCH: "icon-assets"  # branch icons get published to
 ```
 
 ## Adding another source
@@ -237,6 +241,57 @@ There are two templates, on purpose:
   `render_app_card_html()`, the same function `build_html()` uses, so
   the cards themselves are guaranteed identical between the two - only
   the surrounding chrome (sidebar/topbar/grid vs. plain stack) differs.
+
+## Icon hosting
+
+[#icon-hosting](#icon-hosting)
+
+Worth being upfront about this one, since it's the one piece here that
+isn't solving a problem this project actually has.
+
+App icons come from Apple's own CDN (`mzstatic.com`), which is built
+for exactly this kind of external hotlinking - it's what every app
+review site and App Store link preview on the web already does. Left
+alone, that's already reliable.
+
+This project's sibling, [9gag-meme-emailer](https://github.com/tuongphantrue/9gag-meme-emailer),
+downloads its images and republishes them to a dedicated `meme-assets`
+branch, served back out via `raw.githubusercontent.com`, because *its*
+source images aren't something you can reliably hotlink long-term. That
+specific problem doesn't apply to Apple's icon CDN. This project adopts
+the same pattern anyway, by explicit choice, for consistency with the
+rest of the project family rather than necessity - noting that
+up front so it doesn't read as if rehosting were fixing something that
+was actually broken.
+
+**How it works:** `rehost_icons()` in `apps_gone_free_emailer.py`
+downloads each newly-free app's icon into `ICON_ASSETS_DIR` and rewrites
+its URL to the future `raw.githubusercontent.com` location. The
+workflow's **"Publish images to the icon-assets branch"** step then
+pushes that directory to a dedicated `icon-assets` branch - same
+git-worktree trick as the dedup-state branch, tested to correctly
+*accumulate* icons across runs rather than overwrite them (unlike
+state, old emails still need their images to keep resolving later) -
+and **"Wait for raw.githubusercontent.com to serve the new files"**
+gives the CDN ~30s to catch up before the email actually sends.
+
+**A real trade-off worth knowing about:** unlike the dedup-state file,
+icons are never pruned - every unique app icon ever emailed stays in
+that branch forever, since deleting one could break the image in an
+already-delivered email if the recipient's mail client re-fetches
+remote images on every open rather than caching at delivery time (this
+varies by client). Icons are small (a few KB each at the size used
+here) and this only downloads new ones on days something's actually
+newly free, so growth should stay modest in practice - but if it's ever
+worth bounding, `ICON_ASSETS_DIR` / `ICON_ASSETS_BRANCH` are both
+configurable, and a time-based prune of the branch is the natural place
+to add it later.
+
+Both `ICON_ASSETS_DIR` and `GITHUB_REPOSITORY` (set automatically by
+GitHub Actions) have to be present for any of this to activate -
+running `generate` locally or `preview` never downloads or rewrites
+icons, so both keep their existing "no surprise network calls" behavior
+unchanged.
 
 ## Notes
 
