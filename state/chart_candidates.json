@@ -911,7 +911,7 @@
 },
 "6792648049": {
 "name": "Worst Passengers Airline Rides",
-"price": 2.99,
+"price": 4.99,
 "first_seen": "2026-08-05",
 "last_checked": "2026-08-05",
 "misses": 0
@@ -940,6 +940,27 @@
 "1531679862": {
 "name": "GENKI Vocab for 3rd Ed.",
 "price": 6.99,
+"first_seen": "2026-08-05",
+"last_checked": "2026-08-05",
+"misses": 0
+},
+"1373567447": {
+"name": "Loon",
+"price": 7.99,
+"first_seen": "2026-08-05",
+"last_checked": "2026-08-05",
+"misses": 0
+},
+"6791031647": {
+"name": "Texas WBGT",
+"price": 0.99,
+"first_seen": "2026-08-05",
+"last_checked": "2026-08-05",
+"misses": 0
+},
+"6760838876": {
+"name": "Oldi - Phone Camera",
+"price": 0.99,
 "first_seen": "2026-08-05",
 "last_checked": "2026-08-05",
 "misses": 0
