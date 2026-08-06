@@ -7,58 +7,87 @@ computer needed). Same generate/send two-phase shape, Gmail-SMTP delivery,
 and dedup-via-state-branch trick as gold-price-emailer / house-price-emailer
 / tech-price-mailer / currency-rate-emailer.
 
-WHICH SITE THIS SCRAPES, AND WHY
-----------------------------------
+THREE SOURCES, AND WHY NOT JUST ONE
+--------------------------------------
 A lot of the well-known "apps gone free" trackers people remember are dead:
+AppShopper (shut down 2021), iOSnoops (shut down since), AppAdvice's list
+(stopped updating early 2026). AppRaven is JS-only with nothing for a
+plain scraper to read. AppsHunter.io/148apps are general catalogs, not a
+clean "gone free" list. AppStore-Discounts.com would've been ideal but its
+robots.txt disallows automated access. PSprices.com turned out to be a
+console/PC gaming tracker. Reddit r/AppHookup's format is too inconsistent
+to parse reliably without auth. Yitake.in reads as templated filler. Full
+history of what was checked and why each was ruled out: README.md's
+"Important: read this before relying on it" table.
 
-- AppShopper.com (the original) shut down 2021-06-30.
-- iOSnoops.com - active as recently as 2023 - has since shut down too
-  ("we have decided to shut down the site... the economics are not there
-  anymore" per its own homepage).
-- AppAdvice's "Apps Gone Free" daily list stopped being updated in early
-  2026 (Apple tightened App Review enforcement on free-to-paid price-flip
-  promos). appadvice.com/apps-gone-free is still online but frozen on a
-  mid-January 2026 post.
-- AppRaven (appraven.net), a currently-active alternative, is a client-side
-  JS app with no server-rendered HTML ("You need to enable JavaScript to
-  run this app") - nothing for a plain `requests` scraper to read.
-- AppsHunter.io and 148apps.com are still alive but are general app
-  catalogs/gaming-news sites, not a clean "gone free today" listing.
+Given how thin that leaves things, this doesn't lean on any one source:
 
-iGeeksBlog (igeeksblog.com) is: it maintains one persistent, bookmarkable
-page - not per-day archive URLs - with a "Today's Apps Gone Free" section
-that it edits in place daily:
-    https://www.igeeksblog.com/paid-iphone-apps-gone-free/
-That's the primary (and, honestly, only) source this script scrapes today.
+1. iGeeksBlog (igeeksblog.com) - one persistent, bookmarkable page it
+   edits in place daily. parse_igeeksblog() targets its "WP-Appbox"
+   listing plugin directly (div.wpappbox / .apptitle / .appicon /
+   .price .value), confirmed against real page source. Ids come
+   straight from a real apps.apple.com link on the page - certain, not
+   guessed (see SOURCES_WITH_CERTAIN_IDS).
+2. AppDovo (appdovo.com) - a mixed iOS+Android, free+discounted feed;
+   parse_appdovo() filters to iOS + exactly 100% off. Its own links go
+   to AppDovo's site, not the App Store, so the id is inferred from a
+   digit run in AppDovo's cached icon filenames - a reasonable bet, not
+   a certainty, so these entries get a stricter identity check in
+   enrich_and_verify() (lookup match AND name match required, or
+   dropped) rather than the benefit of the doubt a certain id gets.
+3. Apple's own top-paid chart feed (rss.applemarketingtools.com,
+   discover_chart_gone_free()) - no scraping at all, auto-discovers
+   popular paid apps and reports genuine price-drops-to-$0 between
+   runs. Structurally immune to the markup breakage that hit both
+   scrapers above at various points while this was being built.
 
-Every app it finds gets cross-checked against Apple's own iTunes Lookup
-API (https://itunes.apple.com/lookup, documented at
-performance-partners.apple.com) as a sanity check - if a plain "Free"
-listing (not "Free+") no longer shows $0.00 there, the page is probably
-stale for that entry, so it's dropped with a logged reason rather than
-emailed. The lookup also fills in developer/genre/rating/description for
-a nicer email, since iGeeksBlog's list itself is just icon + name + price.
+Every scraped app (sources 1-2) is cross-checked against Apple's own
+iTunes Lookup API (https://itunes.apple.com/lookup) - a plain "Free"
+listing that no longer shows $0.00 there gets dropped as stale. "Free+"
+listings can't be verified on price the same way (a free-to-download app
+always shows $0.00 in Lookup, promo or not), so those pass through on
+the source's word alone, subject to the identity check above for
+non-certain ids. The lookup also fills in developer/genre/rating/
+description for a nicer email either way.
 
-ADDING A SECOND SOURCE
+Any one (or two) of the three sources failing no longer means an empty
+inbox - see cmd_generate()'s "Every source found 0 apps" check for the
+one case where it still does (all three genuinely down at once).
+
+ADDING ANOTHER SOURCE
 ------------------------
-The SOURCES list below is exactly one entry. If you find another site
-worth scraping, write a `parse_<site>(html) -> [{"id", "name", "icon",
-"url", "price_label"}, ...]` function (see parse_igeeksblog for the
-shape) and append {"name": ..., "url": ..., "parser": ...} to SOURCES -
-fetch_all_sources() already merges/dedupes across whatever's in that list.
+Two extension points: another *scraped* site goes in the SOURCES list
+below (see parse_igeeksblog() or parse_appdovo() for the shape,
+depending on whether the site links directly to the App Store or not);
+another *official API* worth polling the same way as Apple's chart feed
+follows discover_chart_gone_free()'s pattern instead, independent of
+SOURCES entirely. Full guidance: README.md's "Adding another source".
+
+ICON REHOSTING (OPTIONAL, GITHUB ACTIONS ONLY)
+-------------------------------------------------
+rehost_icons() can download each newly-free app's icon and rewrite its
+URL to a raw.githubusercontent.com location a workflow step publishes
+it to - mirrors 9gag-meme-emailer's meme-assets-branch pattern. Off by
+default (ICON_ASSETS_DIR unset); local runs and `preview` are always
+unaffected regardless. Full discussion of why this isn't solving a
+problem Apple's own icon CDN actually has, adopted anyway for
+consistency with the rest of the project family: README.md's "Icon
+hosting".
 
 USAGE
 -----
     python apps_gone_free_emailer.py generate
-        -> scrapes the source(s), cross-checks/enriches via iTunes Lookup,
-           writes the composed email (subject/html/text) under ./email/,
-           and updates the "already notified about this app" state file
+        -> runs all three sources, cross-checks/enriches the scraped ones
+           via iTunes Lookup, writes the composed email (subject/html/text)
+           under ./email/, and updates the two state files (notified-apps
+           dedup + chart price-history)
     python apps_gone_free_emailer.py send
         -> reads ./email/* and sends it via Gmail SMTP
     python apps_gone_free_emailer.py preview
         -> writes preview.html / preview.txt from sample data through the
            real template functions - no network, no state touched, nothing
-           sent. Use this to check the design after editing build_html().
+           sent. Use this to check the design after editing build_html()
+           or build_preview_page_html().
 
 SETUP
 -----
@@ -70,7 +99,8 @@ SETUP
      - Needs 2-Step Verification turned on first.
 
 3. Set these as environment variables (see README.md for GitHub Actions
-   secrets instead, if running in the cloud):
+   secrets instead, if running in the cloud; README.md's "Configuration"
+   section has the full list including chart/icon-rehosting settings):
      export GMAIL_ADDRESS="youraddress@gmail.com"
      export GMAIL_APP_PASSWORD="16-char-app-password"
      export APPS_RECIPIENT="where-to-send@example.com"
@@ -84,10 +114,11 @@ SETUP
 NOTE ON SCRAPING
 -----------------
 Always worth checking the current robots.txt / terms before running this
-unattended long-term: https://www.igeeksblog.com/robots.txt
+unattended long-term: https://www.igeeksblog.com/robots.txt and
+https://appdovo.com/robots.txt
 
-iGeeksBlog's page markup can change at any time. (An earlier version of
-this note theorized that a 0-apps run might be bot/anti-scraping
+Either scraped site's markup can change at any time. (An earlier version
+of this note theorized that a 0-apps run might be bot/anti-scraping
 filtering treating this script's request differently than a browser's -
 that turned out not to be it: a real 0-apps run's raw HTML showed the
 actual page came through fine, just structured differently than
@@ -98,14 +129,15 @@ fetch_all_sources() saves the raw response it actually received to
 DEBUG_DIR (uploaded as a workflow artifact - see README's
 "Troubleshooting" section) and logs whether "gone free" text shows up
 anywhere in it at all - that's the fast way to tell "the real page came
-through, parse_igeeksblog() needs adjusting to match a markup change"
-apart from "this wasn't the real page at all," but either way, the
-actual saved HTML is what settles it, not a guess. parse_igeeksblog()
-itself targets iGeeksBlog's app-listing plugin ("WP-Appbox," visible in
-an HTML comment around each entry) directly via its div.wpappbox /
+through, the parser needs adjusting to match a markup change" apart
+from "this wasn't the real page at all," but either way, the actual
+saved HTML is what settles it, not a guess. parse_igeeksblog() itself
+targets iGeeksBlog's app-listing plugin ("WP-Appbox," visible in an
+HTML comment around each entry) directly via its div.wpappbox /
 .apptitle / .appicon / .price .value structure, confirmed against real
 page source rather than inferred from a text-only rendering. Open the
-page, view source, and adjust parse_igeeksblog() if it starts returning 0.
+page, view source, and adjust the relevant parse_<site>() function if
+it starts returning 0.
 """
 
 import json
@@ -134,7 +166,7 @@ if os.environ.get("ALLOW_INSECURE_SSL_FALLBACK", "false").lower() == "true":
 # Printed at the start of every `generate` run specifically so a log is
 # self-describing about which fix actually ran, rather than needing to
 # diff file contents by hand to answer "is this the latest version?"
-SCRIPT_VERSION = "2026-08-01.8 (icon rehosting via icon-assets branch)"
+SCRIPT_VERSION = "2026-08-02.10 (docs/footer consistency audit - AppDovo credit + stats fix)"
 
 COUNTRY = os.environ.get("COUNTRY", "us").strip().lower()
 STATE_FILE = os.environ.get("STATE_FILE", "state/notified.json")
@@ -319,10 +351,95 @@ def parse_igeeksblog(html):
     return apps
 
 
+APPDOVO_URL = os.environ.get("APPDOVO_URL", "https://appdovo.com/apps-gone-free-today/")
+APPDOVO_ICON_ID_RE = re.compile(r"/(\d{8,12})[A-Za-z]")  # leading digit run in AppDovo's cached icon filenames
+
+
+def parse_appdovo(html):
+    """AppDovo mixes iOS + Android and fully-free + merely-discounted
+    entries in one unified list (no separate "gone free" vs "on sale"
+    sections the way iGeeksBlog has), so this filters for both: platform
+    tag exactly "iOS" (not "android"), and current price exactly "FREE"
+    (not just some % off).
+
+    Unlike iGeeksBlog, this listing page's own links go to AppDovo's own
+    site (/apps/<slug>/), not directly to the App Store - there's no
+    apps.apple.com link on this page to read a certain id from. Instead
+    this reads a leading digit run AppDovo embeds in its own cached icon
+    filenames (e.g. ".../6774355361AppIcon-....jpg"), which matches
+    Apple's id format closely enough to be a reasonable bet - but it IS a
+    bet, not a certainty the way iGeeksBlog's id is. See
+    SOURCES_WITH_CERTAIN_IDS / enrich_and_verify(): AppDovo is
+    deliberately left out of that set, so a wrong guess here gets caught
+    and dropped by the stricter identity check there (no match, or a
+    name that doesn't line up) rather than shipping a broken or
+    mismatched App Store link.
+
+    Also worth flagging: built from a fetched/rendered copy of the page
+    text, not raw HTML - AppDovo wasn't available for the same direct
+    view-source inspection iGeeksBlog eventually was, so treat this the
+    same way iGeeksBlog's very first version should have been treated:
+    a best effort, protected by the same debug-artifact safety net if
+    the real markup turns out to disagree with what this assumes.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    apps = []
+    seen_ids = set()
+    for img in soup.find_all("img", src=True):
+        m = APPDOVO_ICON_ID_RE.search(img["src"])
+        if not m:
+            continue
+        candidate_id = m.group(1)
+        if candidate_id in seen_ids:
+            continue
+
+        lines = []
+        for tag in img.find_all_next(True):
+            if tag.name == "img":
+                break  # reached the next app's card - this one's done
+            if tag.name == "a" and re.search(r"view details", tag.get_text(strip=True), re.IGNORECASE):
+                break  # reached this app's own closing link - also done
+            if not tag.find(True):  # leaf-ish text node
+                text = tag.get_text(strip=True)
+                if text:
+                    lines.append(text)
+        if not lines:
+            continue
+
+        platform, name, is_free = None, None, False
+        for line in lines:
+            pf = re.match(r"^(iOS|android)\b", line, re.IGNORECASE)
+            if pf and platform is None:
+                platform = pf.group(1)
+                continue
+            if re.fullmatch(r"free", line, re.IGNORECASE):
+                is_free = True
+                continue
+            if name is None and not re.match(r"^\$[\d.,]+$|^\d+%\s*off$", line, re.IGNORECASE):
+                name = line
+
+        if platform and platform.lower() == "ios" and is_free and name:
+            seen_ids.add(candidate_id)
+            apps.append({
+                "id": candidate_id,
+                "name": name,
+                "icon": img["src"],
+                "url": f"https://apps.apple.com/app/id{candidate_id}",
+                "price_label": "Free",
+                "source": "AppDovo",
+            })
+    return apps
+
+
 SOURCES = [
     {"name": "iGeeksBlog", "url": IGEEKSBLOG_URL, "parser": parse_igeeksblog},
+    {"name": "AppDovo", "url": APPDOVO_URL, "parser": parse_appdovo},
     # Add more sites here as {"name": ..., "url": ..., "parser": parse_fn} -
-    # see the module docstring ("ADDING A SECOND SOURCE").
+    # see the module docstring ("ADDING A SECOND SOURCE"). Remember to add
+    # the source's "name" to SOURCES_WITH_CERTAIN_IDS too, but only if its
+    # ids are read directly from a real apps.apple.com link on the page -
+    # if they're inferred/guessed the way AppDovo's are, leave it out so
+    # enrich_and_verify() applies the stricter identity check instead.
 ]
 
 
@@ -422,18 +539,48 @@ def lookup_apps(app_ids, country=COUNTRY):
     return records
 
 
+SOURCES_WITH_CERTAIN_IDS = {"iGeeksBlog"}  # id read directly from a real apps.apple.com link - a failed
+# lookup for these just means transient/region-locked/delisted, so the entry is kept and trusted as-is.
+# Any OTHER source's id is treated as a guess (see parse_appdovo() for why) - a failed lookup for those
+# almost certainly means the guess itself was wrong, so the entry gets dropped rather than trusted.
+
+
+def names_roughly_match(a, b):
+    """Loose match for cross-checking a guessed id's looked-up name against
+    the name a source actually scraped - not exact-string comparison,
+    since sources often abbreviate/punctuate app names slightly
+    differently (e.g. app's own "NeonVortex" vs a listing site's "Neon
+    Vortex"). Case/punctuation/whitespace-insensitive substring check in
+    either direction is intentionally forgiving; the id itself being
+    guessed correctly is what actually matters here, and a name that's
+    not even a partial match either way is a strong signal it wasn't."""
+    norm = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())
+    a, b = norm(a), norm(b)
+    return bool(a) and bool(b) and (a in b or b in a)
+
+
 def enrich_and_verify(apps, country=COUNTRY):
     """Fills in developer/genre/rating/description from the Lookup API, and
     drops entries the Lookup API contradicts. The only entries this can
-    actually contradict are plain "Free" ones (previously a paid, one-time
-    purchase, now $0 to download): the Lookup API's `price` field reflects
-    the CURRENT download price, so a plain "Free" listing that no longer
-    shows $0.00 there means the page is stale for that app. "Free+" apps
-    (free to download with the premium tier unlocked, normally an
-    in-app-purchase/subscription) always show $0.00 in Lookup regardless
-    of whether the unlock promo is still live, since the download itself
-    is always free either way - so Lookup can't verify or contradict
-    those, and they're passed through on the source site's word alone.
+    actually contradict on PRICE are plain "Free" ones (previously a
+    paid, one-time purchase, now $0 to download): the Lookup API's
+    `price` field reflects the CURRENT download price, so a plain "Free"
+    listing that no longer shows $0.00 there means the page is stale for
+    that app. "Free+" apps (free to download with the premium tier
+    unlocked, normally an in-app-purchase/subscription) always show
+    $0.00 in Lookup regardless of whether the unlock promo is still live,
+    since the download itself is always free either way - so Lookup
+    can't verify or contradict those on price, and they're passed
+    through on the source site's word alone (unless their id fails the
+    identity check below).
+
+    Separately, on IDENTITY: SOURCES_WITH_CERTAIN_IDS get the benefit of
+    the doubt if Lookup simply doesn't return a record (transient miss,
+    region lock, delisted - the id itself was never in question). Any
+    other source's id is a guess (see parse_appdovo()), so for those, no
+    record OR a record whose name doesn't reasonably match what was
+    scraped means the guess was probably wrong - dropped rather than
+    risking a broken or mismatched App Store link in the email.
 
     If the Lookup API is unreachable entirely, every app is kept as-is
     (scraped fields only) rather than blocking the email on an
@@ -447,12 +594,21 @@ def enrich_and_verify(apps, country=COUNTRY):
     kept = []
     for app in apps:
         record = records.get(app["id"])
+        id_is_certain = app.get("source") in SOURCES_WITH_CERTAIN_IDS
         if record is None:
-            kept.append(app)  # couldn't verify (region-locked, delisted, transient miss) - trust the source
+            if id_is_certain:
+                kept.append(app)  # couldn't verify (region-locked, delisted, transient miss) - trust the source
+            else:
+                print(f"  dropping {app['name']!r} from {app.get('source')}: no iTunes Lookup match for "
+                      f"guessed id {app['id']} - the guess was probably wrong.", file=sys.stderr)
+            continue
+        if not id_is_certain and not names_roughly_match(app["name"], record["name"]):
+            print(f"  dropping {app['name']!r} from {app.get('source')}: guessed id {app['id']} resolved to "
+                  f"a different app ({record['name']!r}) - wrong guess.", file=sys.stderr)
             continue
         is_plain_free = app["price_label"].strip().lower() == "free"
         if is_plain_free and record["price"] > 0:
-            print(f"  dropping {app['name']!r}: iGeeksBlog lists it as Free but iTunes Lookup shows "
+            print(f"  dropping {app['name']!r}: {app.get('source')} lists it as Free but iTunes Lookup shows "
                   f"a price of {record['price']} now - likely stale.", file=sys.stderr)
             continue
         merged = {**app}
@@ -462,7 +618,7 @@ def enrich_and_verify(apps, country=COUNTRY):
         merged["rating_count"] = record["rating_count"]
         merged["description"] = record["description"]
         # Prefer Lookup's own artwork/URL when present - marginally more
-        # likely to be current than whatever iGeeksBlog embedded.
+        # likely to be current than whatever the source embedded.
         merged["icon"] = record["icon"] or app["icon"]
         merged["url"] = record["url"] or app["url"]
         kept.append(merged)
@@ -491,6 +647,8 @@ def enrich_and_verify(apps, country=COUNTRY):
 CHART_URL_TEMPLATE = "https://rss.applemarketingtools.com/api/v2/{country}/apps/top-paid/{limit}/apps.json"
 CHART_LIMIT = int(os.environ.get("CHART_LIMIT", "100"))
 CHART_FALLBACK_LIMIT = 100  # the endpoint informally 500s above ~100 as of 2026; see fetch_top_paid_ids()
+CHART_FETCH_RETRIES = int(os.environ.get("CHART_FETCH_RETRIES", "3"))  # retries per limit on transient network errors
+CHART_FETCH_RETRY_DELAY = int(os.environ.get("CHART_FETCH_RETRY_DELAY", "5"))  # seconds between retries
 CHART_STATE_FILE = os.environ.get("CHART_STATE_FILE", "state/chart_candidates.json")
 CHART_MAX_TRACK_AGE_DAYS = int(os.environ.get("CHART_MAX_TRACK_AGE_DAYS", "21"))
 CHART_MAX_TRACKED_APPS = int(os.environ.get("CHART_MAX_TRACKED_APPS", "2000"))
@@ -499,24 +657,38 @@ CHART_MAX_CONSECUTIVE_MISSES = 3
 
 def fetch_top_paid_ids(country=COUNTRY, limit=CHART_LIMIT):
     """Returns a list of App Store id strings from Apple's top-paid chart
-    feed. Falls back to CHART_FALLBACK_LIMIT if the requested limit errors
-    out."""
+    feed. Two independent layers of retry here, for two different failure
+    modes: falls back to CHART_FALLBACK_LIMIT if the requested limit
+    itself gets rejected (the endpoint's own constraints), and separately
+    retries CHART_FETCH_RETRIES times on transient network errors
+    (timeouts, connection resets) at whichever limit is being tried -
+    when limit already equals CHART_FALLBACK_LIMIT (the default case),
+    the limit-fallback loop only ever runs once, so without this second
+    layer a single transient timeout had zero cushion at all."""
     tried = []
     for this_limit in dict.fromkeys([limit, CHART_FALLBACK_LIMIT]):
         tried.append(this_limit)
         url = CHART_URL_TEMPLATE.format(country=country, limit=this_limit)
-        try:
-            resp = http_get(url)
-            data = resp.json()
-            results = data.get("feed", {}).get("results", [])
-            ids = [r["id"] for r in results if r.get("id")]
-            if ids:
-                if this_limit != limit:
-                    print(f"  (chart: used fallback limit={this_limit} after limit={limit} failed)", file=sys.stderr)
-                return ids
-            print(f"  chart fetch at limit={this_limit} returned 0 ids.", file=sys.stderr)
-        except (requests.RequestException, ValueError) as e:
-            print(f"  chart fetch at limit={this_limit} failed: {e}", file=sys.stderr)
+        for attempt in range(1, CHART_FETCH_RETRIES + 1):
+            try:
+                resp = http_get(url)
+                data = resp.json()
+                results = data.get("feed", {}).get("results", [])
+                ids = [r["id"] for r in results if r.get("id")]
+                if ids:
+                    if this_limit != limit:
+                        print(f"  (chart: used fallback limit={this_limit} after limit={limit} failed)", file=sys.stderr)
+                    return ids
+                print(f"  chart fetch at limit={this_limit} returned 0 ids.", file=sys.stderr)
+                break  # got a real response, just empty - retrying won't change that; try the next limit instead
+            except (requests.RequestException, ValueError) as e:
+                if attempt < CHART_FETCH_RETRIES:
+                    print(f"  chart fetch at limit={this_limit} failed (attempt {attempt}/{CHART_FETCH_RETRIES}): "
+                          f"{e} - retrying in {CHART_FETCH_RETRY_DELAY}s...", file=sys.stderr)
+                    time.sleep(CHART_FETCH_RETRY_DELAY)
+                else:
+                    print(f"  chart fetch at limit={this_limit} failed after {CHART_FETCH_RETRIES} attempts: {e}",
+                          file=sys.stderr)
     print(f"  giving up on chart discovery this run (tried limits {tried}).", file=sys.stderr)
     return []
 
@@ -740,12 +912,13 @@ def build_html(new_apps, timestamp, stats):
   <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:720px;margin:0 auto;">
     <tr><td>
       <h1 style="color:{TEXT_PRIMARY};font-size:28px;font-weight:800;letter-spacing:-.02em;margin:0 0 8px;">iOS Apps Gone Free</h1>
-      <p style="color:{TEXT_SECONDARY};font-size:14px;margin:0 0 24px;">Checked {escape(timestamp)} &middot; {stats.get('scraped', 0)} from iGeeksBlog + {stats.get('chart', 0)} from Apple's top-paid chart &middot; {stats['new']} new &middot; {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days</p>
+      <p style="color:{TEXT_SECONDARY};font-size:14px;margin:0 0 24px;">Checked {escape(timestamp)} &middot; {stats.get('scraped', 0)} from iGeeksBlog/AppDovo + {stats.get('chart', 0)} from Apple's top-paid chart &middot; {stats['new']} new &middot; {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days</p>
       {cards}
       <p style="color:{TEXT_SECONDARY}; font-size:12px; line-height:1.6; margin-top:28px;">
-        Sources: <a href="{escape(IGEEKSBLOG_URL)}" style="color:{ACCENT};">iGeeksBlog - Today's Apps Gone Free</a>
-        (hand-curated) and Apple's own top-paid chart feed (auto-discovered, tracked for price drops) &middot;
-        both cross-checked against Apple's iTunes Lookup API (country={escape(COUNTRY)}) &middot; "FREE+" means
+        Sources: <a href="{escape(IGEEKSBLOG_URL)}" style="color:{ACCENT};">iGeeksBlog</a> and
+        <a href="{escape(APPDOVO_URL)}" style="color:{ACCENT};">AppDovo</a> (both hand-curated/scraped) and
+        Apple's own top-paid chart feed (auto-discovered, tracked for price drops) &middot;
+        all cross-checked against Apple's iTunes Lookup API (country={escape(COUNTRY)}) &middot; "FREE+" means
         the app itself was already free to download and a premium/subscription tier has been unlocked for now,
         not that the whole app was a paid download &middot; Promotions can end at any time - check the App Store
         link before assuming it's still free.
@@ -759,7 +932,7 @@ def build_html(new_apps, timestamp, stats):
 def build_plain_text(new_apps, timestamp, stats):
     lines = [
         f"iOS Apps Gone Free - checked {timestamp}",
-        f"{stats.get('scraped', 0)} from iGeeksBlog + {stats.get('chart', 0)} from Apple's top-paid chart, "
+        f"{stats.get('scraped', 0)} from iGeeksBlog/AppDovo + {stats.get('chart', 0)} from Apple's top-paid chart, "
         f"{stats['new']} new, {stats['repeat']} already sent within the last {COOLDOWN_DAYS} days",
         "",
     ]
@@ -806,7 +979,7 @@ def build_preview_page_html(new_apps, timestamp, stats):
       <div style="font-size:12px;color:{TEXT_SECONDARY};margin-top:2px;">{label}</div>
     </div>""" for value, label in [
         (stats["new"], "New today"),
-        (stats.get("scraped", 0), "From iGeeksBlog"),
+        (stats.get("scraped", 0), "From iGeeksBlog/AppDovo"),
         (stats.get("chart", 0), "From Apple charts"),
         (f"{COOLDOWN_DAYS}d", "Repeat cooldown"),
     ])
@@ -869,8 +1042,8 @@ def build_preview_page_html(new_apps, timestamp, stats):
           This is a local preview generated by <code>python apps_gone_free_emailer.py preview</code> from
           sample data - not a real digest. The cards above use the exact same rendering as the real email;
           only this sidebar/topbar chrome is preview-only, since actual emails don't have navigation. Sources:
-          <a href="{escape(IGEEKSBLOG_URL)}">iGeeksBlog</a> and Apple's top-paid chart feed, both cross-checked
-          against Apple's iTunes Lookup API.
+          <a href="{escape(IGEEKSBLOG_URL)}">iGeeksBlog</a>, <a href="{escape(APPDOVO_URL)}">AppDovo</a>, and
+          Apple's top-paid chart feed, all cross-checked against Apple's iTunes Lookup API.
         </div>
       </div>
     </div>
@@ -959,13 +1132,13 @@ def cmd_generate():
 
     combined = verified + chart_new
     if not scraped and not new_chart_state:
-        # Both sources have literally nothing: the scrape found 0 apps AND
+        # Every scraped site (iGeeksBlog, AppDovo) came back with nothing AND
         # the chart source has never successfully tracked a single
         # candidate (this run's chart fetch failed with no prior state to
         # fall back on either). That's a real problem worth flagging
         # loudly, distinct from "nothing NEW today" (normal, most days,
         # handled further down) - don't touch state.
-        print("Both sources found 0 apps this run - probably a scraper/markup or API problem, "
+        print("Every source found 0 apps this run - probably a scraper/markup or API problem, "
               "not a quiet day. Aborting without sending or touching the notified-apps state.",
               file=sys.stderr)
         with open(os.path.join(EMAIL_DIR, "meta.json"), "w") as f:
@@ -1049,15 +1222,15 @@ def cmd_send():
 
 
 def cmd_preview():
-    """Generates preview.html (a full nav/hero/grid webpage, see
+    """Generates preview.html (a full sidebar/topbar/grid webpage, see
     build_preview_page_html()) and preview.txt (build_plain_text(), same
     as a real email) from sample data. The individual app cards on
     preview.html come from render_app_card_html() - the exact same
     function build_html() uses for real emails - so a card can never look
     cosmetically different here than it would in an actual email; only
-    the surrounding nav/hero/grid chrome is preview-only, since real
-    emails don't have navigation bars. Sample apps mix both sources and
-    both price labels on purpose, to show the visual variety a real
+    the surrounding sidebar/topbar/grid chrome is preview-only, since real
+    emails don't have navigation bars. Sample apps mix all three sources
+    and both price labels on purpose, to show the visual variety a real
     digest can have. Doesn't touch state, doesn't send anything, doesn't
     hit the network."""
     sample_apps = [
@@ -1086,6 +1259,14 @@ def cmd_preview():
             "price_label": "Free+", "source": "iGeeksBlog",
         },
         {
+            "id": "6774355361", "name": "NeonVortex", "developer": "Jeff Curtis",
+            "icon": "https://appdovo.com/wp-content/uploads/2026/08/6774355361AppIcon-0-0-1x_pad-300x300.jpg",
+            "url": "https://apps.apple.com/app/id6774355361", "genre": "Music",
+            "rating": 4.6, "rating_count": 512,
+            "description": "A visual music player with reactive neon animations synced to your library.",
+            "price_label": "Free", "source": "AppDovo",
+        },
+        {
             "id": "0000000001", "name": "[SAMPLE] Focus Timer Pro", "developer": "Placeholder Co",
             "icon": "", "url": "https://apps.apple.com/app/id0000000001", "genre": "Productivity",
             "rating": 4.8, "rating_count": 15420,
@@ -1094,7 +1275,12 @@ def cmd_preview():
             "price_label": "Free", "source": "Apple Top-Paid Chart",
         },
     ]
-    stats = {"scraped": 3, "chart": 1, "new": len(sample_apps), "repeat": 2}
+    # Computed from sample_apps itself rather than hardcoded - a hardcoded
+    # count is exactly how the missing AppDovo example above went unnoticed
+    # when that source was added.
+    scraped_count = sum(1 for a in sample_apps if a["source"] != "Apple Top-Paid Chart")
+    chart_count = sum(1 for a in sample_apps if a["source"] == "Apple Top-Paid Chart")
+    stats = {"scraped": scraped_count, "chart": chart_count, "new": len(sample_apps), "repeat": 2}
     _, timestamp = resolve_timestamp()
     html = build_preview_page_html(sample_apps, timestamp, stats)
     text = build_plain_text(sample_apps, timestamp, stats)
