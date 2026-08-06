@@ -12,7 +12,7 @@ dedup-via-state-branch trick.
 
 [#important-read-this-before-relying-on-it](#important-read-this-before-relying-on-it)
 
-A lot of the sites people remember for this have quietly died. Two
+A lot of the sites people remember for this have quietly died. Three
 rounds of checking what's actually still alive in 2026:
 
 | Site | Status |
@@ -26,11 +26,13 @@ rounds of checking what's actually still alive in 2026:
 | AppStore-Discounts.com | Would've been ideal - 770K+ apps, hourly refresh via Apple's own API, explicitly tracks apps hitting 100% free - but its `robots.txt` disallows automated access. Skipped on principle. |
 | PSprices.com | Has an RSS feed and clean pages, but turns out to be a console/PC gaming price tracker (PlayStation, Xbox, Switch) with iOS as a minor secondary platform - wrong scope. |
 | Reddit r/AppHookup | Active (204k members), and individual posts do follow a `[iOS] [App] [$X → Free]` bracket convention - but it mixes multi-day roundup posts with individual ones, spans many platforms, and reliable JSON API access without auth is genuinely uncertain in 2026. Didn't clear the bar to ship. |
-| **iGeeksBlog.com** | **Still active and actually updated daily** - one bookmarkable page it edits in place. |
+| Yitake.in | Has a "Today's Apps Gone Free" page, but the content reads as templated/AI-generated filler rather than genuinely curated - passed on quality grounds. |
+| **iGeeksBlog.com** | **Active, updated daily** - one bookmarkable page it edits in place. |
+| **AppDovo.com** | **Active, recently-updated content** - a mixed iOS+Android, free+discounted deals feed. See below for how this one's integrated and its one real caveat. |
 
-Given how thin that list is, this doesn't rely on iGeeksBlog alone -
-it runs **two independent sources** and merges whatever either one
-finds:
+Given how thin that list is, this doesn't rely on any one site alone -
+it runs **three independent sources** and merges whatever any of them
+find:
 
 1. **iGeeksBlog scrape** - the hand-curated list above, the same way
    tech-price-mailer scrapes MemoryZone.vn. Every app it finds is
@@ -41,19 +43,38 @@ finds:
    unlocked for now) can't be verified the same way, since a free
    download always shows $0.00 regardless - those go out on
    iGeeksBlog's own editorial word.
-2. **Apple's own top-paid chart feed** - auto-discovers popular paid
+2. **AppDovo scrape** - mixes iOS/Android and free/merely-discounted
+   deals in one list, filtered here to iOS + exactly 100% off. Worth
+   knowing the one real caveat: this listing page's own links go to
+   AppDovo's site, not the App Store, so there's no `apps.apple.com`
+   link to read a certain id from the way there is on iGeeksBlog.
+   `parse_appdovo()` instead reads a leading digit run AppDovo embeds
+   in its own cached icon filenames (e.g.
+   `.../6774355361AppIcon-....jpg`), which matches Apple's id format
+   closely enough to be a reasonable bet - but it's a bet, not a
+   certainty. Because of that, AppDovo entries go through a stricter
+   check than iGeeksBlog's: the guessed id has to resolve via iTunes
+   Lookup *and* the looked-up name has to reasonably match what was
+   scraped, or the entry gets dropped rather than risking a broken or
+   mismatched link (see `SOURCES_WITH_CERTAIN_IDS` /
+   `enrich_and_verify()`). Verified against a fixture built from
+   AppDovo's real fetched content, but not against raw HTML the way
+   iGeeksBlog eventually was - same debug-artifact safety net applies
+   if the real markup turns out to disagree.
+3. **Apple's own top-paid chart feed** - auto-discovers popular paid
    apps directly from Apple (`rss.applemarketingtools.com`, no
    scraping involved at all), remembers each one's price between runs,
    and reports any that drop to $0.00. Structurally immune to the kind
-   of HTML/markup breakage that hit the scraper three separate times
-   while this was being built - there's no page to change.
+   of HTML/markup breakage that hit the scrapers repeatedly while this
+   was being built - there's no page to change.
 
-The two sources have different blind spots on purpose: iGeeksBlog
-catches smaller/niche apps a human bothered to feature; the chart
-catches popular apps regardless of whether any editor ever wrote about
-them. Either one failing (site down, markup changed, Apple's API
-having a bad day) no longer means an empty inbox - see "Both sources
-failing" in Troubleshooting for the one case that still does.
+The three sources have different blind spots on purpose: iGeeksBlog and
+AppDovo each catch apps a human/algorithm bothered to feature that the
+other might not; the chart catches popular apps regardless of whether
+any site ever wrote about them. Any one (or two) failing - site down,
+markup changed, Apple's API having a bad day - no longer means an empty
+inbox, as long as at least one source still comes through - see "Every
+source found 0 apps this run" in Troubleshooting for the case where none do.
 
 This is a personal notification tool, not a guarantee of catching every
 app that goes free, and not purchase advice - always check the App
@@ -171,6 +192,7 @@ ALWAYS_SEND: "false"                 # "true" = still send a "nothing new" email
 TIMEZONE: "Asia/Ho_Chi_Minh"         # only affects the timestamp shown in the email
 STATE_FILE: "state/notified.json"    # dedup state file path
 IGEEKSBLOG_URL: "https://www.igeeksblog.com/paid-iphone-apps-gone-free/"
+APPDOVO_URL: "https://appdovo.com/apps-gone-free-today/"
 ALLOW_INSECURE_SSL_FALLBACK: "false" # last-resort TLS bypass
 
 # Apple top-paid chart source
@@ -178,6 +200,8 @@ CHART_LIMIT: "100"                        # apps to pull from the chart per run 
 CHART_STATE_FILE: "state/chart_candidates.json"  # separate state file - price history for chart-discovered apps
 CHART_MAX_TRACK_AGE_DAYS: "21"            # stop watching a chart candidate after this long if it never goes free
 CHART_MAX_TRACKED_APPS: "2000"            # hard cap on the chart candidate state file's size
+CHART_FETCH_RETRIES: "3"                  # retries per limit on transient network errors (timeouts etc.)
+CHART_FETCH_RETRY_DELAY: "5"              # seconds between those retries
 
 # Icon rehosting (see "Icon hosting" below - only activates inside GitHub Actions)
 ICON_ASSETS_DIR: ""      # local dir to save downloaded icons into; empty (default) = rehosting disabled
@@ -192,14 +216,19 @@ Two different extension points, depending on what you find:
 
 - **Another scraped listing site**: `SOURCES` near the top of
   `apps_gone_free_emailer.py` is a list of `{"name", "url", "parser"}` -
-  currently just the one entry for iGeeksBlog. `fetch_all_sources()`
-  already fetches every entry in that list, tolerates any one of them
-  failing, and dedupes apps by App Store id across sources. Write a
+  iGeeksBlog and AppDovo currently. `fetch_all_sources()` already
+  fetches every entry in that list, tolerates any one of them failing,
+  and dedupes apps by App Store id across sources. Write a
   `parse_<site>(html) -> [{"id", "name", "icon", "url", "price_label"}, ...]`
-  function (see `parse_igeeksblog()` for the shape) and append it to
-  `SOURCES`. Worth grabbing real page source (view-source, not a
-  text/markdown rendering of it) before writing the parser - see
-  "Troubleshooting" below for exactly why that distinction mattered here.
+  function (see `parse_igeeksblog()` for the shape, or `parse_appdovo()`
+  if the site doesn't link directly to the App Store) and append it to
+  `SOURCES`. If the site's own links go straight to `apps.apple.com`,
+  add its name to `SOURCES_WITH_CERTAIN_IDS` too; if the id has to be
+  inferred some other way, leave it out so `enrich_and_verify()` applies
+  the stricter identity check instead. Worth grabbing real page source
+  (view-source, not a text/markdown rendering of it) before writing the
+  parser - see "Troubleshooting" below for exactly why that distinction
+  mattered here.
 - **Another official API, same shape as the chart source**: if you find
   another store's or service's own public API worth tracking the same
   way (auto-discover candidates, remember prices, report drops to $0),
@@ -321,18 +350,49 @@ unchanged.
   server for a page that only changes about once a day.
 - This is a personal notification tool, not investment or purchase advice.
 
-### Troubleshooting: a run logs "Both sources found 0 apps this run"
+### Troubleshooting: a run logs "Every source found 0 apps this run"
 
-[#troubleshooting-a-run-logs-both-sources-found-0-apps-this-run](#troubleshooting-a-run-logs-both-sources-found-0-apps-this-run)
+[#troubleshooting-a-run-logs-every-source-found-0-apps-this-run](#troubleshooting-a-run-logs-every-source-found-0-apps-this-run)
 
 This is the only case where nothing gets emailed *and* state is left
-untouched entirely - both the scrape and the chart discovery came back
-with genuinely nothing, not just nothing new. Two independent things
-would both have to be broken at once for this to fire, so it's worth
-checking the log for which one(s) actually failed: the scrape logs its
-own reason (see below), and the chart source logs `chart fetch at
-limit=N failed: ...` if `rss.applemarketingtools.com` itself is
-unreachable or erroring.
+untouched entirely - every scraped site (iGeeksBlog and AppDovo both)
+and the chart discovery all came back with genuinely nothing, not just
+nothing new. Three independent things would all have to be broken at
+once for this to fire, so it's worth checking the log for which one(s)
+actually failed: each scraped site logs its own reason (see below), and
+the chart source logs `chart fetch at limit=N failed: ...` if
+`rss.applemarketingtools.com` itself is unreachable or erroring - now
+with a few automatic retries first (see "Chart API reliability" below)
+before it actually gives up.
+
+### Chart API reliability, and why a log's line order can look wrong
+
+[#chart-api-reliability-and-why-a-logs-line-order-can-look-wrong](#chart-api-reliability-and-why-a-logs-line-order-can-look-wrong)
+
+Two small things worth knowing about, both prompted by the same real
+run's log:
+
+- **A single timeout used to be fatal for the chart source.**
+  `fetch_top_paid_ids()` retries with `CHART_FALLBACK_LIMIT` if the
+  *requested* limit gets rejected - but when the limit is already the
+  default (100, same as the fallback), that loop only ever ran once, so
+  a single transient timeout had zero cushion. It now separately retries
+  `CHART_FETCH_RETRIES` times (default 3, `CHART_FETCH_RETRY_DELAY`
+  seconds apart) on network errors specifically, independent of the
+  limit-fallback logic, which exists for a different failure mode
+  entirely (the endpoint rejecting an oversized limit, not the network
+  being flaky).
+- **A confusing log is not necessarily a bug in what actually ran.** If
+  a run's log ever shows error lines appearing *before* the
+  `apps_gone_free_emailer.py version: ...` line that's supposed to print
+  first, that's Python's stdout/stderr buffering, not execution running
+  out of order: `stdout` gets block-buffered when it isn't a real
+  terminal (which it isn't in CI) and only flushes in chunks, while
+  `stderr` always flushes immediately - so error/diagnostic lines
+  (mostly `stderr`) can appear to happen "first" in a combined log even
+  though the actual run order was correct. `PYTHONUNBUFFERED: "1"` is
+  set on the Python-invoking workflow steps specifically so log order
+  matches real execution order going forward.
 
 ### Troubleshooting: iGeeksBlog specifically parses to 0 apps
 
