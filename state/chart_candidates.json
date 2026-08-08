@@ -1097,5 +1097,26 @@
 "first_seen": "2026-08-07",
 "last_checked": "2026-08-08",
 "misses": 0
+},
+"287217531": {
+"name": "FAAwait",
+"price": 0.99,
+"first_seen": "2026-08-08",
+"last_checked": "2026-08-08",
+"misses": 0
+},
+"361784690": {
+"name": "FAR/AIM by ASA",
+"price": 19.95,
+"first_seen": "2026-08-08",
+"last_checked": "2026-08-08",
+"misses": 0
+},
+"1041727137": {
+"name": "Bound - Audiobook Player",
+"price": 4.99,
+"first_seen": "2026-08-08",
+"last_checked": "2026-08-08",
+"misses": 0
 }
 }
